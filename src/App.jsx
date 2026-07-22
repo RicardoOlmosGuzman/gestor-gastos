@@ -29,21 +29,16 @@ const fmtDate=d=>{if(!d)return"";try{return new Date(d+"T12:00").toLocaleDateStr
 const fmtGreeting=()=>{const h=NOW.getHours();return h<12?"Buenos días":h<19?"Buenas tardes":"Buenas noches";};
 
 // Plantilla helpers — el corazón del nuevo modelo
-const tmplTotal=addr=>(addr?.template?.categories||[]).reduce((s,c)=>(c.items||[]).reduce((ss,it)=>ss+(it.amount||0),s),0);
-const allTmplItems=addr=>(addr?.template?.categories||[]).flatMap(c=>(c.items||[]).map(it=>({...it,catName:c.name,catIcon:c.icon,catColor:c.color,catId:c.id})));
+const tmplTotal=addr=>(addr?.template?.categories||[]).reduce((s,c)=>(c.items||[]).reduce((ss,it)=>ss+Math.round((it.amount||0)*(MF[it.frequency||"mensual"]||1)),s),0);
+const allTmplItems=addr=>(addr?.template?.categories||[]).flatMap(c=>(c.items||[]).map(it=>{const mAmt=Math.round((it.amount||0)*(MF[it.frequency||"mensual"]||1));return{...it,catName:c.name,catIcon:c.icon,catColor:c.color,catId:c.id,monthlyAmt:mAmt};}));
+const itemAccumulated=(addr,y,m,itemId)=>mPays(addr,y,m).filter(p=>p.templateItemId===itemId).reduce((s,p)=>s+(p.amount||0),0);
 const mPays=(addr,y,m)=>(addr?.months||[]).find(x=>x.year===y&&x.month===m)?.payments||[];
 const totalPaid=(addr,y,m)=>mPays(addr,y,m).reduce((s,p)=>s+(p.amount||0),0);
 
 // Ítems pendientes de la plantilla (no pagados este mes)
-const pendingTmpl=(addr,y,m)=>{
-  const pays=mPays(addr,y,m);
-  return allTmplItems(addr).filter(it=>!pays.find(p=>p.templateItemId===it.id));
-};
+const pendingTmpl=(addr,y,m)=>allTmplItems(addr).map(it=>({...it,accumulated:itemAccumulated(addr,y,m,it.id)})).filter(it=>it.accumulated<it.monthlyAmt);
 // Ítems de plantilla ya pagados este mes
-const paidTmpl=(addr,y,m)=>{
-  const pays=mPays(addr,y,m);
-  return allTmplItems(addr).map(it=>{const pay=pays.find(p=>p.templateItemId===it.id);return pay?{...it,pay}:null;}).filter(Boolean);
-};
+const paidTmpl=(addr,y,m)=>allTmplItems(addr).map(it=>{const acc=itemAccumulated(addr,y,m,it.id);const pays=mPays(addr,y,m).filter(p=>p.templateItemId===it.id);return acc>0?{...it,accumulated:acc,pays,isPaid:acc>=it.monthlyAmt}:null;}).filter(Boolean);
 // Pagos extra (no de plantilla)
 const extraPays=(addr,y,m)=>mPays(addr,y,m).filter(p=>p.isExtra);
 
@@ -60,6 +55,22 @@ const smartSuggestions=addr=>{
   return Object.values(counts).filter(x=>x.count>=2).slice(0,3);
 };
 
+// Gastos frecuentes conocidos — ordenados por popularidad de uso (más usado primero)
+const knownExtrasSorted=addr=>[...(addr?.knownExtras||[])].sort((a,b)=>(b.useCount||0)-(a.useCount||0)||new Date(b.lastDate||0)-new Date(a.lastDate||0));
+const matchKnownExtra=(addr,name)=>{
+  const k=(name||"").trim().toLowerCase();
+  if(!k)return null;
+  return (addr?.knownExtras||[]).find(x=>x.name.trim().toLowerCase()===k)||null;
+};
+const searchKnownExtras=(addr,query)=>{
+  const q=(query||"").trim().toLowerCase();
+  const all=knownExtrasSorted(addr);
+  if(!q)return all.slice(0,6);
+  return all.filter(k=>k.name.toLowerCase().includes(q)).slice(0,6);
+};
+// Cuántas veces se ha usado realmente una categoría en pagos históricos (para ordenar el gestor por frecuencia real)
+const catUsageCount=(addr,catId)=>(addr?.months||[]).reduce((s,m)=>s+(m.payments||[]).filter(p=>p.catId===catId).length,0);
+
 /* ══ STORAGE (localStorage para web real) ════════════════ */
 const ldata=async()=>{try{const r=localStorage.getItem(SK);return r?JSON.parse(r):null;}catch{return null;}};
 const sdata=async d=>{try{localStorage.setItem(SK,JSON.stringify(d));}catch{}};
@@ -74,7 +85,7 @@ const saveAK=k=>{try{localStorage.setItem(AK_KEY,k);}catch{}};
 const INIT={
   addresses:[],selAddr:null,selYear:CY,selMonth:CM,
   profile:{name:"",incomes:[],availability:{hoursPerWeek:0,canWork:true,studying:false,entrepreneur:false,notes:""},goals:[]},
-  settings:{dark:false,alertPct:25,linkProf:false,tutDone:false},
+  settings:{dark:false,alertPct:25,linkProf:false,tutDone:false,iaGuideDismissed:false},
   aiHistory:[]
 };
 const upA=(addrs,id,fn)=>addrs.map(a=>a.id===id?fn(a):a);
@@ -94,16 +105,30 @@ function red(s,a){
     case"YM":return{...s,...(a.year!==undefined&&{selYear:a.year}),...(a.month!==undefined&&{selMonth:a.month})};
     case"SA":return{...s,selAddr:a.id};
     // Direcciones
-    case"AA":{const n={id:uid(),name:a.name,address:a.addr||"",template:{categories:[]},months:[]};return{...s,addresses:[...s.addresses,n],selAddr:n.id};}
+    case"AA":{const n={id:uid(),name:a.name,address:a.addr||"",template:{categories:[]},months:[],knownExtras:[]};return{...s,addresses:[...s.addresses,n],selAddr:n.id};}
     case"UA":return{...s,addresses:upA(s.addresses,a.id,x=>({...x,name:a.name,address:a.addr||""}))};
     case"DA":return{...s,addresses:s.addresses.filter(x=>x.id!==a.id),selAddr:s.selAddr===a.id?null:s.selAddr};
     // Plantilla — categorías
-    case"ATC":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:[...(ad.template?.categories||[]),{id:uid(),name:a.name,icon:a.icon,color:a.color,items:[]}]}}))};
-    case"UTC":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,name:a.name,icon:a.icon,color:a.color}:c)}}))};
-    case"DTC":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).filter(c=>c.id!==a.cid)}}))};
+    case"ATC":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:[...(ad.template?.categories||[]),{id:a.id||uid(),name:a.name,icon:a.icon,color:a.color,items:[]}]}}))};
+    case"UTC":return{...s,addresses:upA(s.addresses,a.aid,ad=>{
+      const cats=(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,name:a.name,icon:a.icon,color:a.color}:c);
+      const ke=(ad.knownExtras||[]).map(k=>k.catId===a.cid?{...k,catName:a.name}:k);
+      const months=(ad.months||[]).map(m=>({...m,payments:(m.payments||[]).map(p=>p.catId===a.cid?{...p,catName:a.name}:p)}));
+      return{...ad,template:{...ad.template,categories:cats},knownExtras:ke,months};
+    })};
+    case"DTC":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).filter(c=>c.id!==a.cid)},knownExtras:(ad.knownExtras||[]).map(k=>k.catId===a.cid?{...k,catId:null}:k)}))};
+    case"MERGE_CAT":return{...s,addresses:upA(s.addresses,a.aid,ad=>{
+      const cats=ad.template?.categories||[];
+      const src=cats.find(c=>c.id===a.srcId),tgt=cats.find(c=>c.id===a.tgtId);
+      if(!src||!tgt||src.id===tgt.id)return ad;
+      const newCats=cats.filter(c=>c.id!==src.id).map(c=>c.id===tgt.id?{...c,items:[...(c.items||[]),...(src.items||[])]}:c);
+      const newKE=(ad.knownExtras||[]).map(k=>k.catId===src.id?{...k,catId:tgt.id,catName:tgt.name}:k);
+      const newMonths=(ad.months||[]).map(m=>({...m,payments:(m.payments||[]).map(p=>(p.catId===src.id||(!p.catId&&p.catName===src.name))?{...p,catId:tgt.id,catName:tgt.name}:p)}));
+      return{...ad,template:{...ad.template,categories:newCats},knownExtras:newKE,months:newMonths};
+    })};
     // Plantilla — ítems
-    case"ATI":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,items:[...(c.items||[]),{id:uid(),name:a.name,amount:a.amount||0,isVariable:a.isVariable||false}]}:c)}}))};
-    case"UTI":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,items:(c.items||[]).map(it=>it.id===a.iid?{...it,name:a.name,amount:a.amount||0,isVariable:a.isVariable||false}:it)}:c)}}))};
+    case"ATI":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,items:[...(c.items||[]),{id:uid(),name:a.name,amount:a.amount||0,isVariable:a.isVariable||false,frequency:a.frequency||"mensual"}]}:c)}}))};
+    case"UTI":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,items:(c.items||[]).map(it=>it.id===a.iid?{...it,name:a.name,amount:a.amount||0,isVariable:a.isVariable||false,frequency:a.frequency||"mensual"}:it)}:c)}}))};
     case"DTI":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,items:(c.items||[]).filter(it=>it.id!==a.iid)}:c)}}))};
     // Pagos del mes
     case"ADD_PAY":return{...s,addresses:upA(s.addresses,a.aid,ad=>{
@@ -111,6 +136,10 @@ function red(s,a){
       return{...ad,months:months.map(m=>m.id===mid?{...m,payments:[...(m.payments||[]),{id:uid(),...a.d}]}:m)};
     })};
     case"DEL_PAY":return{...s,addresses:upA(s.addresses,a.aid,ad=>mapM(ad,s.selYear,s.selMonth,m=>({...m,payments:(m.payments||[]).filter(p=>p.id!==a.pid)})))};
+    // Gastos frecuentes conocidos (autocompletado inteligente)
+    case"AKE":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,knownExtras:[...(ad.knownExtras||[]),{useCount:1,lastAmount:0,lastDate:"",...a.d}]}))};
+    case"BKE":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,knownExtras:(ad.knownExtras||[]).map(k=>k.id===a.id?{...k,useCount:(k.useCount||0)+1,lastAmount:a.amount,lastDate:a.date}:k)}))};
+    case"DKE":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,knownExtras:(ad.knownExtras||[]).filter(k=>k.id!==a.id)}))};
     // Perfil
     case"SP":return{...s,profile:{...s.profile,...a.d}};
     case"AINC":return{...s,profile:{...s.profile,incomes:[...s.profile.incomes,{id:uid(),...a.d}]}};
@@ -170,7 +199,7 @@ function MoneyInput({val,onChange,ph="$0",t,sx={},af}){
   useEffect(()=>{if(af&&ref.current)ref.current.focus();},[af]);
   return <input ref={ref} type="text" value={disp}
     onChange={e=>{const n=pCLP(e.target.value);setDisp(fCLP(n));onChange(n);}}
-    onFocus={e=>{setDisp("");setTimeout(()=>e.target.select(),10);}}
+    onFocus={e=>setTimeout(()=>e.target.select(),10)}
     onBlur={()=>setDisp(val>0?fCLP(val):"")}
     placeholder={ph} style={{width:"100%",padding:"0.5rem 0.75rem",background:t.card2,border:`1px solid ${t.border}`,borderRadius:"0.5rem",color:t.text,fontSize:"0.9rem",boxSizing:"border-box",outline:"none",...sx}}/>;
 }
@@ -220,34 +249,118 @@ function ProgressBar({value,max,t}){
 }
 
 /* Modal de pago rápido — usado en Inicio e Historial */
-function PayModal({state,t,onClose,onSave,catNames=[]}){
+/* Autocompletado de gastos frecuentes: recuerda lugares/ítems usados antes,
+   ordenados por frecuencia de uso (los usados una sola vez se hunden solos) */
+function ExtraNameField({value,onChange,onPick,addr,t}){
+  const[open,setOpen]=useState(false);
+  const[hi,setHi]=useState(0);
+  const sugg=searchKnownExtras(addr,value);
+  const showDropdown=open&&sugg.length>0;
+  const pick=k=>{onPick(k);setOpen(false);};
+  return <div style={{position:"relative"}}>
+    <input value={value}
+      onChange={e=>{onChange(e.target.value);setOpen(true);setHi(0);}}
+      onFocus={()=>setOpen(true)}
+      onBlur={()=>setTimeout(()=>setOpen(false),150)}
+      onKeyDown={e=>{
+        if(!showDropdown)return;
+        if(e.key==="ArrowDown"){e.preventDefault();setHi(p=>Math.min(p+1,sugg.length-1));}
+        else if(e.key==="ArrowUp"){e.preventDefault();setHi(p=>Math.max(p-1,0));}
+        else if(e.key==="Tab"||e.key==="Enter"){if(sugg[hi]){e.preventDefault();pick(sugg[hi]);}}
+        else if(e.key==="Escape")setOpen(false);
+      }}
+      placeholder="Luz, Almacén, Netflix, Uber..."
+      style={{width:"100%",padding:"0.5rem 0.75rem",background:t.card2,border:`1px solid ${t.border}`,borderRadius:"0.5rem",color:t.text,fontSize:"0.875rem",boxSizing:"border-box",outline:"none"}}/>
+    {showDropdown&&<div style={{position:"absolute",top:"calc(100% + 4px)",left:0,right:0,background:t.card,border:`1px solid ${t.border}`,borderRadius:"0.5rem",boxShadow:t.shadow,zIndex:50,maxHeight:"220px",overflowY:"auto"}}>
+      {sugg.map((k,i)=><div key={k.id} onMouseDown={()=>pick(k)} style={{display:"flex",alignItems:"center",gap:"0.5rem",padding:"0.5rem 0.7rem",background:i===hi?t.pri+"15":"transparent",cursor:"pointer",borderBottom:i<sugg.length-1?`1px solid ${t.border}`:"none"}}>
+        <span style={{flex:1,color:t.text,fontSize:"0.83rem",fontWeight:i===hi?700:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{k.name}</span>
+        {k.catName&&<Badge ch={k.catName} color={t.pri}/>}
+        <span style={{color:t.dim,fontSize:"0.68rem",whiteSpace:"nowrap"}}>{k.useCount||1}×</span>
+      </div>)}
+      <div style={{padding:"0.3rem 0.7rem",color:t.dim,fontSize:"0.66rem",borderTop:`1px solid ${t.border}`}}>↑↓ navegar · Tab/Enter elegir</div>
+    </div>}
+  </div>;
+}
+function InlineCatPicker({cats,onPick,t}){
+  const[adding,setAdding]=useState(false);const[nn,setNn]=useState("");
+  return <div>
+    <div style={{display:"flex",flexWrap:"wrap",gap:"0.4rem"}}>
+      {cats.map(c=><button key={c.id} onClick={()=>onPick(c)} style={{display:"flex",alignItems:"center",gap:"0.3rem",padding:"0.3rem 0.65rem",background:t.card2,border:`1px solid ${t.border}`,borderRadius:"9999px",cursor:"pointer",color:t.text,fontSize:"0.78rem"}}>
+        <span>{c.icon||"📦"}</span>{c.name}
+      </button>)}
+      {!adding&&<button onClick={()=>setAdding(true)} style={{display:"flex",alignItems:"center",gap:"0.3rem",padding:"0.3rem 0.65rem",background:"transparent",border:`1px dashed ${t.pri}`,borderRadius:"9999px",cursor:"pointer",color:t.pri,fontSize:"0.78rem",fontWeight:600}}>
+        <Plus size={11}/> Nueva categoría
+      </button>}
+    </div>
+    {adding&&<div style={{display:"flex",gap:"0.4rem",marginTop:"0.5rem"}}>
+      <TI val={nn} onChange={setNn} ph="Nombre de la categoría..." t={t}/>
+      <Btn onClick={()=>{if(nn.trim()){onPick({__new:true,name:nn.trim()});setAdding(false);setNn("");}}} dis={!nn.trim()} sz="sm" icon={<Check size={12}/>}>Crear</Btn>
+    </div>}
+  </div>;
+}
+function PayModal({state,t,onClose,onSave,addr,d}){
   const[name,setName]=useState(state.itemName||"");
-  const[amount,setAmount]=useState(state.estimated||0);
+  const[amount,setAmount]=useState(state.remaining!==undefined?state.remaining:(state.estimated||0));
   const[date,setDate]=useState(state.date||todayStr());
   const[note,setNote]=useState("");const[method,setMethod]=useState("Transferencia");
-  const[catName,setCatName]=useState(state.catName||"");
+  const[matched,setMatched]=useState(null);
+  const[pickedNewCat,setPickedNewCat]=useState(null);
   const isExtra=state.isExtra!==false;
-  return <Modal title={isExtra?"⚡ Registrar Pago Extra":"✓ Marcar como Pagado"} onClose={onClose} t={t} ch={<>
-    {!isExtra&&<div style={{display:"flex",gap:"0.5rem",padding:"0.6rem 0.75rem",background:t.ok+"12",borderRadius:"0.5rem",marginBottom:"0.85rem",fontSize:"0.82rem",color:t.muted,alignItems:"center"}}>
-      <CheckCircle2 size={14} color={t.ok}/><span>Ítem: <strong style={{color:t.text}}>{state.itemName}</strong> · Estimado: <strong style={{color:t.text}}>{fCLP(state.estimated)}</strong></span>
+  const cats=addr?.template?.categories||[];
+  const liveMatch=isExtra?matchKnownExtra(addr,name):null;
+  const effectiveMatch=matched||liveMatch;
+  const needsCategory=isExtra&&name.trim().length>0&&!effectiveMatch&&!pickedNewCat;
+
+  const handlePick=k=>{setMatched(k);setName(k.name);setAmount(k.lastAmount||0);setPickedNewCat(null);};
+  const handleCatPick=c=>{
+    if(c.__new){
+      const newCatId=uid();
+      d({t:"ATC",aid:addr.id,id:newCatId,name:c.name,icon:"📦",color:COLORS[cats.length%COLORS.length]});
+      setPickedNewCat({id:newCatId,name:c.name});
+    }else setPickedNewCat({id:c.id,name:c.name});
+  };
+  const handleSave=()=>{
+    if(!name||!amount)return;
+    let catId=null,catName="",knownExtraId=null;
+    if(isExtra){
+      if(effectiveMatch){
+        catId=effectiveMatch.catId;catName=effectiveMatch.catName;knownExtraId=effectiveMatch.id;
+        d({t:"BKE",aid:addr.id,id:effectiveMatch.id,amount,date});
+      }else if(pickedNewCat){
+        catId=pickedNewCat.id;catName=pickedNewCat.name;
+        const keId=uid();
+        d({t:"AKE",aid:addr.id,d:{id:keId,name,catId,catName}});
+        knownExtraId=keId;
+      }
+    }else{catId=state.catId||null;catName=state.catName||"";}
+    onSave({name,amount,date,method,note,catId,catName,knownExtraId,templateItemId:state.itemId||null,isExtra});
+  };
+
+  return <Modal title={isExtra?"⚡ Registrar Pago":"✓ Marcar como Pagado"} onClose={onClose} t={t} ch={<>
+    {!isExtra&&<div style={{padding:"0.6rem 0.75rem",background:t.ok+"12",borderRadius:"0.5rem",marginBottom:"0.85rem",fontSize:"0.82rem",color:t.muted}}>
+      <div style={{display:"flex",gap:"0.5rem",alignItems:"center",marginBottom:state.accumulated>0?"0.4rem":"0"}}><CheckCircle2 size={14} color={t.ok}/><span>Ítem: <strong style={{color:t.text}}>{state.itemName}</strong> · Total mes: <strong style={{color:t.text}}>{fCLP(state.estimated)}</strong></span></div>
+      {state.accumulated>0&&<div style={{display:"flex",gap:"0.75rem",fontSize:"0.79rem",paddingLeft:"0.25rem"}}><span>✅ Ya abonado: <strong style={{color:t.ok}}>{fCLP(state.accumulated)}</strong></span><span>⏳ Pendiente: <strong style={{color:t.warn}}>{fCLP(state.remaining)}</strong></span></div>}
     </div>}
-    {isExtra&&<div style={{display:"flex",gap:"0.5rem",padding:"0.6rem 0.75rem",background:t.warn+"12",borderRadius:"0.5rem",marginBottom:"0.85rem",fontSize:"0.82rem",color:t.muted,alignItems:"center"}}>
-      <Zap size={14} color={t.warn}/><span>Se suma al total del mes. Puedes asociarlo a una categoría para el análisis.</span>
+    {isExtra?<Fld label="¿Qué pagaste?" ch={<ExtraNameField value={name} onChange={v=>{setName(v);setMatched(null);setPickedNewCat(null);}} onPick={handlePick} addr={addr} t={t}/>} t={t}/>
+             :<Fld label="¿Qué pagaste?" ch={<TI val={name} onChange={setName} ph="Nombre del gasto" t={t}/>} t={t}/>}
+    {isExtra&&effectiveMatch&&<div style={{display:"flex",alignItems:"center",gap:"0.5rem",padding:"0.5rem 0.7rem",background:t.ok+"12",border:`1px solid ${t.ok}35`,borderRadius:"0.5rem",marginBottom:"0.85rem",fontSize:"0.79rem",color:t.muted}}>
+      <CheckCircle2 size={13} color={t.ok}/><span>Ya lo conocemos — va en <strong style={{color:t.text}}>{effectiveMatch.catName||"sin categoría"}</strong> · usado {effectiveMatch.useCount||1}× antes</span>
     </div>}
-    <Fld label="¿Qué pagaste?" ch={<TI val={name} onChange={setName} ph="Luz, Almacén, Netflix, Uber..." t={t}/>} t={t}/>
-    <Fld label={isExtra?"Monto pagado":"Monto real (puede diferir del estimado)"} ch={<MoneyInput val={amount} onChange={setAmount} t={t} af/>} t={t}/>
-    {isExtra&&catNames.length>0&&<Fld label="Categoría (opcional, para análisis)" ch={
-      <select value={catName} onChange={e=>setCatName(e.target.value)} style={{width:"100%",padding:"0.5rem 0.75rem",background:t.card2,border:`1px solid ${t.border}`,borderRadius:"0.5rem",color:t.text,fontSize:"0.875rem",outline:"none"}}>
-        <option value="">Sin categoría</option>
-        {catNames.map(c=><option key={c} value={c}>{c}</option>)}
-      </select>
-    } t={t}/>}
+    {isExtra&&pickedNewCat&&<div style={{display:"flex",alignItems:"center",gap:"0.5rem",padding:"0.5rem 0.7rem",background:t.info+"12",border:`1px solid ${t.info}35`,borderRadius:"0.5rem",marginBottom:"0.85rem",fontSize:"0.79rem",color:t.muted}}>
+      <Sparkles size={13} color={t.info}/><span>🆕 Nuevo — quedará guardado en <strong style={{color:t.text}}>{pickedNewCat.name}</strong> para la próxima vez</span>
+    </div>}
+    {needsCategory&&<div style={{marginBottom:"0.85rem"}}>
+      <div style={{color:t.text,fontSize:"0.82rem",fontWeight:600,marginBottom:"0.4rem"}}>Es la primera vez — ¿en qué categoría va "{name}"?</div>
+      <InlineCatPicker cats={cats} onPick={handleCatPick} t={t}/>
+    </div>}
+    <Fld label={isExtra?"Monto pagado":"Monto real (puede diferir del estimado)"} ch={<div>
+      <MoneyInput val={amount} onChange={setAmount} t={t} af/>
+      {isExtra&&effectiveMatch&&effectiveMatch.lastAmount>0&&amount!==effectiveMatch.lastAmount&&<button onClick={()=>setAmount(effectiveMatch.lastAmount)} style={{background:"none",border:"none",cursor:"pointer",color:t.pri,fontSize:"0.74rem",marginTop:"0.3rem",display:"flex",alignItems:"center",gap:"0.25rem"}}><Sparkles size={11}/> Usar último monto: {fCLP(effectiveMatch.lastAmount)}</button>}
+    </div>} t={t}/>
     <Fld label="Fecha" ch={<TI val={date} onChange={setDate} type="date" t={t}/>} t={t}/>
     <Fld label="Forma de pago" ch={<Sel val={method} onChange={setMethod} opts={PAY_METHODS} t={t}/>} t={t}/>
     <Fld label="Nota (opcional)" ch={<TI val={note} onChange={setNote} ph="Info extra..." t={t}/>} t={t}/>
-    <Btn onClick={()=>name&&amount&&onSave({name,amount,date,method,note,catName:catName||state.catName||"",templateItemId:state.itemId||null,isExtra:state.isExtra!==false})} dis={!name||!amount} full icon={<Check size={14}/>}>
-      {isExtra?"Registrar pago ⚡":"Confirmar pago ✓"}
-    </Btn>
+    <Btn onClick={handleSave} dis={!name||!amount} full icon={<Check size={14}/>}>{isExtra?"Registrar pago ⚡":"Confirmar pago ✓"}</Btn>
   </>}/>;
 }
 
@@ -256,12 +369,12 @@ function Tutorial({onDone,t}){
   const[step,setStep]=useState(0);
   const STEPS=[
     {e:"👋",title:"¡Hola! Bienvenido a GestorGastos",desc:"Esta app está hecha para ser simple en el uso diario.\n\nEl objetivo: abres la app, registras lo que pagaste, la cierras.\n\nTe mostramos cómo funciona todo. Puedes volver aquí con el botón ❓ del menú.",hint:""},
-    {e:"🏠",title:"Inicio — Tu centro de operaciones",desc:"Aquí está todo lo que necesitas en el día a día:\n\n• Cuánto llevas pagado este mes vs tu presupuesto\n• Tus gastos fijos pendientes de pagar (un tap para marcarlos)\n• Botón grande para registrar cualquier gasto en segundos\n• Sugerencias inteligentes basadas en tus hábitos",hint:"💡 Esta es la pantalla que abrirás todos los días. El flujo es: abrir → pagar → cerrar."},
+    {e:"🏠",title:"Inicio — Tu centro de operaciones",desc:"Aquí está todo lo que necesitas en el día a día:\n\n• Cuánto llevas pagado este mes vs tu presupuesto\n• Tus gastos fijos pendientes de pagar (un tap para marcarlos)\n• Botón grande para registrar cualquier gasto en segundos\n• Chips de \"pago frecuente\" — repite un gasto que ya hiciste antes con un solo tap\n• Al escribir, la app recuerda lugares que ya usaste y sugiere su categoría automáticamente. Si es nuevo, te deja crear la categoría ahí mismo",hint:"💡 Esta es la pantalla que abrirás todos los días. El flujo es: abrir → pagar → cerrar."},
     {e:"📋",title:"Gastos Fijos — Configuras una vez",desc:"Aquí defines los gastos que tienes TODOS los meses:\n• Arriendo: $350.000 (fijo)\n• Luz: ~$40.000 (variable, cambia cada mes)\n• Agua, internet, suscripciones...\n\nLos configuras UNA VEZ y aparecen como pendientes automáticamente cada mes. Nunca más tienes que volver a ingresarlos.",hint:"💡 Si un monto varía (luz, agua), márcalo como 'variable'. El monto que pones es solo una estimación."},
     {e:"📅",title:"Historial — El mes en detalle",desc:"El calendario mensual muestra todo:\n• Los días con pagos tienen puntos de color\n• Verde = gasto fijo pagado · Naranja = gasto extra\n• Click en un día para ver o agregar pagos\n• Navega entre meses con las flechas ‹ ›",hint:""},
     {e:"📊",title:"Análisis — Entiende tus gastos",desc:"Para cuando quieres ver el panorama:\n• Gráfico de presupuesto vs lo que realmente pagaste\n• Distribución por categoría\n• Evolución mes a mes\n\nExporta a Excel o imprime como PDF.",hint:"💡 Úsalo una vez al mes. El resto del tiempo, usa solo la pantalla de Inicio."},
     {e:"👤",title:"Perfil — Tus datos e ingresos",desc:"Configura:\n• Tu nombre (aparece en el saludo)\n• Fuentes de ingreso (sueldo, beca, etc.)\n• Objetivos de ahorro\n• API key para la IA\n\n¡Importante! Aquí también puedes EXPORTAR tus datos como respaldo JSON e IMPORTARLOS si cambias de dispositivo.",hint:"💡 Exporta tus datos regularmente como respaldo. Los datos viven en tu navegador."},
-    {e:"🧠",title:"Plan IA — Tu asesor financiero",desc:"Usando tu presupuesto y gastos reales, la IA genera:\n💰 Plan de ahorro personalizado\n🔍 Diagnóstico categoría por categoría\n🆘 Presupuesto de supervivencia\n🚀 Ideas de ingresos extra para Chile\n📊 Análisis del método 50/30/20",hint:"🔑 Necesitas API key gratuita de Anthropic (console.anthropic.com). La agregas en Perfil."},
+    {e:"🧠",title:"Plan IA — Tu asesor financiero",desc:"Usando tu presupuesto y gastos reales, la IA genera:\n💰 Plan de ahorro personalizado\n🔍 Diagnóstico categoría por categoría\n🆘 Presupuesto de supervivencia\n🚀 Ideas de ingresos extra para Chile\n📊 Análisis del método 50/30/20",hint:"🔑 Necesitas API key gratuita de Anthropic (platform.claude.com). En la pestaña Plan IA hay una guía paso a paso."},
   ];
   const cur=STEPS[step],isLast=step===STEPS.length-1;
   return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.88)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"1rem"}}>
@@ -402,6 +515,18 @@ function HoyView({s,d,t,setView}){
         <Plus size={22}/> Registrar pago ahora
       </button>
 
+      {/* Repetir pago frecuente — un tap, sin escribir nada */}
+      {knownExtrasSorted(addr).length>0&&<div style={{marginBottom:"1rem"}}>
+        <div style={{color:t.muted,fontSize:"0.73rem",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:"0.5rem"}}>⚡ Repetir pago frecuente</div>
+        <div style={{display:"flex",gap:"0.5rem",overflowX:"auto",paddingBottom:"0.2rem"}}>
+          {knownExtrasSorted(addr).slice(0,6).map(k=><button key={k.id} onClick={()=>setPayModal({date:todayStr(),isExtra:true,itemName:k.name,estimated:k.lastAmount})} style={{display:"flex",flexDirection:"column",alignItems:"flex-start",gap:"0.15rem",padding:"0.5rem 0.75rem",background:t.card,border:`1px solid ${t.border}`,borderRadius:"0.6rem",cursor:"pointer",flexShrink:0,minWidth:"108px",boxShadow:t.sm}}>
+            <span style={{color:t.text,fontSize:"0.79rem",fontWeight:700,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",maxWidth:"140px"}}>{k.name}</span>
+            <span style={{color:t.dim,fontSize:"0.66rem"}}>{k.catName||"sin categoría"}</span>
+            <span style={{color:t.pri,fontSize:"0.76rem",fontWeight:600}}>{fCLP(k.lastAmount)}</span>
+          </button>)}
+        </div>
+      </div>}
+
       {/* Sugerencias inteligentes */}
       {suggestions.length>0&&<CCard ch={<>
         <div style={{display:"flex",alignItems:"center",gap:"0.5rem",marginBottom:"0.65rem"}}>
@@ -429,8 +554,11 @@ function HoyView({s,d,t,setView}){
             <div style={{color:t.text,fontSize:"0.84rem",fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.name}</div>
             <div style={{color:t.dim,fontSize:"0.7rem"}}>{it.catName}{it.isVariable?" · variable":""}</div>
           </div>
-          <span style={{color:t.muted,fontSize:"0.83rem",fontWeight:500,whiteSpace:"nowrap"}}>{it.isVariable?"~":""}{fCLP(it.amount)}</span>
-          <Btn onClick={()=>setPayModal({date:todayStr(),isExtra:false,itemId:it.id,itemName:it.name,catName:it.catName,estimated:it.amount})} v="pri" sz="sm">Pagar</Btn>
+          <div style={{textAlign:"right",flexShrink:0}}>
+            {it.accumulated>0&&<div style={{color:t.info,fontSize:"0.7rem",marginBottom:"0.15rem"}}>⟳ {fCLP(it.accumulated)}/{fCLP(it.monthlyAmt)}</div>}
+            <div style={{color:t.muted,fontSize:"0.83rem",fontWeight:500,whiteSpace:"nowrap"}}>{it.isVariable?"~":""}{fCLP(it.monthlyAmt)}{it.frequency&&it.frequency!=="mensual"?` (${FREQS.find(f=>f.v===it.frequency)?.l})`:""}</div>
+          </div>
+          <Btn onClick={()=>setPayModal({date:todayStr(),isExtra:false,itemId:it.id,itemName:it.name,catId:it.catId,catName:it.catName,estimated:it.monthlyAmt,remaining:it.monthlyAmt-it.accumulated,accumulated:it.accumulated})} v={it.accumulated>0?"out":"pri"} sz="sm">{it.accumulated>0?"+ Abonar":"Pagar"}</Btn>
         </div>)}
       </>} t={t} sx={{marginBottom:"1rem"}}/>}
 
@@ -440,18 +568,29 @@ function HoyView({s,d,t,setView}){
           <h3 style={{margin:0,color:t.text,fontSize:"0.93rem",fontWeight:700}}>✅ Pagado este mes</h3>
           <Badge ch={fCLP(paid)} color={t.ok}/>
         </div>
-        {paidItems.map(it=><div key={it.id} style={{display:"flex",alignItems:"center",gap:"0.6rem",padding:"0.45rem 0.7rem",background:t.ok+"10",borderRadius:"0.5rem",marginBottom:"0.3rem",border:`1px solid ${t.ok}30`}}>
-          <CheckCircle2 size={15} color={t.ok}/>
-          <span style={{fontSize:"0.9rem",lineHeight:1}}>{it.catIcon||"📦"}</span>
-          <div style={{flex:1}}>
-            <div style={{color:t.text,fontSize:"0.83rem",fontWeight:500}}>{it.name}</div>
-            <div style={{color:t.dim,fontSize:"0.7rem"}}>{fmtDate(it.pay.date)}{it.pay.method?` · ${it.pay.method}`:""}</div>
+        {paidItems.map(it=><div key={it.id} style={{padding:"0.45rem 0.7rem",background:t.ok+"10",borderRadius:"0.5rem",marginBottom:"0.3rem",border:`1px solid ${t.ok}30`}}>
+          <div style={{display:"flex",alignItems:"center",gap:"0.6rem"}}>
+            {it.isPaid?<CheckCircle2 size={15} color={t.ok}/>:<Clock size={15} color={t.warn}/>}
+            <span style={{fontSize:"0.9rem",lineHeight:1}}>{it.catIcon||"📦"}</span>
+            <div style={{flex:1}}>
+              <div style={{color:t.text,fontSize:"0.83rem",fontWeight:500}}>{it.name}{it.pays.length>1?` · ${it.pays.length} abonos`:""}</div>
+              <div style={{color:t.dim,fontSize:"0.7rem"}}>{fmtDate(it.pays[it.pays.length-1]?.date)}</div>
+            </div>
+            <div style={{textAlign:"right"}}>
+              <div style={{color:it.isPaid?t.ok:t.warn,fontSize:"0.83rem",fontWeight:700}}>{fCLP(it.accumulated)}{!it.isPaid?` / ${fCLP(it.monthlyAmt)}`:""}</div>
+              {!it.isPaid&&<div style={{color:t.dim,fontSize:"0.68rem"}}>parcial</div>}
+            </div>
           </div>
-          <div style={{textAlign:"right"}}>
-            <div style={{color:t.ok,fontSize:"0.83rem",fontWeight:700}}>{fCLP(it.pay.amount)}</div>
-            {it.pay.amount!==it.amount&&<div style={{color:t.dim,fontSize:"0.68rem"}}>est. {fCLP(it.amount)}</div>}
-          </div>
-          <button onClick={()=>setCfm({msg:`¿Desmarcar "${it.name}" como pagado?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:it.pay.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.2rem",display:"flex"}}><RotateCcw size={12}/></button>
+          {it.pays.length>1&&<div style={{marginLeft:"1.9rem",marginTop:"0.35rem",display:"flex",flexDirection:"column",gap:"0.2rem"}}>
+            {it.pays.map(p=><div key={p.id} style={{display:"flex",alignItems:"center",gap:"0.4rem",fontSize:"0.72rem",color:t.dim}}>
+              <span style={{flex:1}}>{fmtDate(p.date)}{p.method?` · ${p.method}`:""}</span>
+              <span style={{color:t.muted,fontWeight:600}}>{fCLP(p.amount)}</span>
+              <button onClick={()=>setCfm({msg:`¿Eliminar este abono de "${it.name}"?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.1rem",display:"flex"}}><Trash2 size={10}/></button>
+            </div>)}
+          </div>}
+          {it.pays.length===1&&<div style={{textAlign:"right",marginTop:"0.15rem"}}>
+            <button onClick={()=>setCfm({msg:`¿Desmarcar "${it.name}" como pagado?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:it.pays[0].id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.15rem",display:"inline-flex",alignItems:"center",gap:"0.2rem",fontSize:"0.7rem"}}><RotateCcw size={11}/> Desmarcar</button>
+          </div>}
         </div>)}
         {extras.map(p=><div key={p.id} style={{display:"flex",alignItems:"center",gap:"0.6rem",padding:"0.45rem 0.7rem",background:t.warn+"10",borderRadius:"0.5rem",marginBottom:"0.3rem",border:`1px solid ${t.warn}30`}}>
           <Zap size={13} color={t.warn}/>
@@ -470,14 +609,49 @@ function HoyView({s,d,t,setView}){
       </div>
     </>}
 
-    {payModal&&<PayModal state={payModal} t={t} onClose={()=>setPayModal(null)} catNames={catNames} onSave={dt=>{d({t:"ADD_PAY",aid:addr.id,d:dt});setPayModal(null);}}/>}
+    {payModal&&<PayModal state={payModal} t={t} addr={addr} d={d} onClose={()=>setPayModal(null)} onSave={dt=>{d({t:"ADD_PAY",aid:addr.id,d:dt});setPayModal(null);}}/>}
     {cfm&&<Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>}
   </div>;
 }
 
 /* ══ PLANTILLA DE GASTOS FIJOS ═══════════════════════════ */
+/* Gestor de categorías: ordenadas por frecuencia real de uso (las usadas una
+   vez se hunden solas) y con opción de fusionar duplicados (ej. "Super" y "super") */
+function CatManagerModal({addr,d,t,onClose}){
+  const[merging,setMerging]=useState(null); // categoría origen que se quiere fusionar
+  const[cfm,setCfm]=useState(null);
+  const cats=addr?.template?.categories||[];
+  const ranked=[...cats].map(c=>({...c,uses:catUsageCount(addr,c.id)+(addr?.knownExtras||[]).filter(k=>k.catId===c.id).length})).sort((a,b)=>b.uses-a.uses);
+
+  if(cfm)return <Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>;
+
+  return <div>
+    <p style={{margin:"0 0 1rem",color:t.muted,fontSize:"0.82rem",lineHeight:1.55}}>Ordenadas por qué tanto las usas. Si tienes dos que en realidad son lo mismo (ej. "Super" y "super"), fusiónalas — todos sus gastos, ítems y montos históricos se combinan en una sola.</p>
+    <div style={{display:"flex",flexDirection:"column",gap:"0.5rem"}}>
+      {ranked.map(c=><div key={c.id} style={{border:`1px solid ${t.border}`,borderRadius:"0.6rem",padding:"0.65rem 0.8rem",background:t.card2}}>
+        <div style={{display:"flex",alignItems:"center",gap:"0.6rem"}}>
+          <span style={{fontSize:"1.1rem"}}>{c.icon||"📦"}</span>
+          <div style={{flex:1}}>
+            <div style={{color:t.text,fontWeight:700,fontSize:"0.87rem"}}>{c.name}</div>
+            <div style={{color:t.dim,fontSize:"0.71rem"}}>{c.uses>0?`Usada ${c.uses}×`:"Sin uso todavía"} · {(c.items||[]).length} gasto(s) fijo(s)</div>
+          </div>
+          <Btn onClick={()=>setMerging(merging===c.id?null:c.id)} v="ghost" sz="sm">{merging===c.id?"Cancelar":"Fusionar en..."}</Btn>
+        </div>
+        {merging===c.id&&<div style={{marginTop:"0.6rem",paddingTop:"0.6rem",borderTop:`1px solid ${t.border}`}}>
+          <div style={{color:t.muted,fontSize:"0.76rem",marginBottom:"0.4rem"}}>Elige la categoría destino — "{c.name}" desaparecerá y todo pasa a ella:</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:"0.4rem"}}>
+            {ranked.filter(x=>x.id!==c.id).map(x=><button key={x.id} onClick={()=>setCfm({msg:`¿Fusionar "${c.name}" dentro de "${x.name}"? Esta acción no se puede deshacer.`,ok:()=>{d({t:"MERGE_CAT",aid:addr.id,srcId:c.id,tgtId:x.id});setMerging(null);setCfm(null);}})} style={{display:"flex",alignItems:"center",gap:"0.3rem",padding:"0.3rem 0.65rem",background:t.card,border:`1px solid ${t.border}`,borderRadius:"9999px",cursor:"pointer",color:t.text,fontSize:"0.78rem"}}>
+              <span>{x.icon||"📦"}</span>{x.name}
+            </button>)}
+          </div>
+        </div>}
+      </div>)}
+    </div>
+    <Btn onClick={onClose} v="ghost" full sx={{marginTop:"1.1rem"}}>Cerrar</Btn>
+  </div>;
+}
 function PlantillaView({s,d,t}){
-  const[aM,setAM]=useState(null);const[cM,setCM]=useState(null);const[iM,setIM]=useState(null);const[cfm,setCfm]=useState(null);
+  const[aM,setAM]=useState(null);const[cM,setCM]=useState(null);const[iM,setIM]=useState(null);const[cfm,setCfm]=useState(null);const[gM,setGM]=useState(false);
   const[expCat,setExpCat]=useState({});
   const addr=s.addresses.find(a=>a.id===s.selAddr);
   const cats=addr?.template?.categories||[];
@@ -520,7 +694,10 @@ function PlantillaView({s,d,t}){
     {addr&&<>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"0.7rem"}}>
         <h3 style={{margin:0,color:t.text,fontSize:"0.97rem",fontWeight:700}}>Mis categorías recurrentes</h3>
-        <Btn onClick={()=>setCM("add")} icon={<Plus size={14}/>} sz="sm">Categoría</Btn>
+        <div style={{display:"flex",gap:"0.4rem"}}>
+          {cats.length>1&&<Btn onClick={()=>setGM(true)} v="ghost" icon={<List size={14}/>} sz="sm">Gestionar</Btn>}
+          <Btn onClick={()=>setCM("add")} icon={<Plus size={14}/>} sz="sm">Categoría</Btn>
+        </div>
       </div>
       {cats.length===0&&<CCard ch={<Empty icon={<List size={34}/>} title="Sin categorías aún" sub='Agrega categorías de gasto fijo como "Vivienda" o "Alimentación". Usa las plantillas para ir rápido.' action={<Btn onClick={()=>setCM("add")} icon={<Plus size={14}/>}>Agregar primera categoría</Btn>} t={t}/>} t={t}/>}
       {cats.map((cat,ci)=>{
@@ -542,8 +719,9 @@ function PlantillaView({s,d,t}){
               <div style={{flex:1}}>
                 <div style={{color:t.text,fontSize:"0.84rem",fontWeight:500}}>{it.name}</div>
                 {it.isVariable&&<div style={{color:t.info,fontSize:"0.7rem"}}>📊 Monto variable (estimado)</div>}
+              {it.frequency&&it.frequency!=="mensual"&&<div style={{color:t.muted,fontSize:"0.69rem"}}>🔄 {FREQS.find(f=>f.v===it.frequency)?.l} → {new Intl.NumberFormat("es-CL",{style:"currency",currency:"CLP",maximumFractionDigits:0}).format(Math.round((it.amount||0)*(MF[it.frequency]||1)))}/mes</div>}
               </div>
-              <span style={{color:it.isVariable?t.info:t.muted,fontSize:"0.84rem",fontWeight:600}}>{it.isVariable?"~":""}{fCLP(it.amount)}</span>
+              <div style={{textAlign:"right"}}><div style={{color:it.isVariable?t.info:t.muted,fontSize:"0.84rem",fontWeight:600}}>{it.isVariable?"~":""}{fCLP(it.amount)}</div>{it.frequency&&it.frequency!=="mensual"&&<div style={{color:t.dim,fontSize:"0.7rem"}}>{FREQS.find(f=>f.v===it.frequency)?.l}</div>}</div>
               <button onClick={()=>setIM({e:it,cid:cat.id})} style={{background:"none",border:"none",cursor:"pointer",color:t.muted,padding:"0.2rem",display:"flex"}}><Edit2 size={12}/></button>
               <button onClick={()=>setCfm({msg:`¿Quitar "${it.name}" de los gastos fijos?`,ok:()=>{d({t:"DTI",aid:addr.id,cid:cat.id,iid:it.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.err,padding:"0.2rem",display:"flex"}}><Trash2 size={12}/></button>
             </div>)}
@@ -560,6 +738,7 @@ function PlantillaView({s,d,t}){
     {aM&&<Modal title={aM==="add"?"Nueva Dirección":"Editar Dirección"} onClose={()=>setAM(null)} t={t} ch={<AddrF init={aM==="add"?{}:{name:aM.e.name,addr:aM.e.address}} onSave={dt=>{aM==="add"?d({t:"AA",...dt}):d({t:"UA",id:aM.e.id,...dt});setAM(null);}} t={t}/>}/>}
     {cM&&<Modal title={cM==="add"?"Nueva Categoría":"Editar Categoría"} onClose={()=>setCM(null)} t={t} ch={<CatF init={cM==="add"?{}:{name:cM.e.name,icon:cM.e.icon,color:cM.e.color}} onSave={dt=>{cM==="add"?d({t:"ATC",aid:addr.id,...dt}):d({t:"UTC",aid:addr.id,cid:cM.e.id,...dt});setCM(null);}} existing={cats.map(c=>c.name)} t={t}/>}/>}
     {iM&&<Modal title={iM.e?"Editar Gasto Fijo":"Nuevo Gasto Fijo"} onClose={()=>setIM(null)} t={t} ch={<TmplItemF init={iM.e?{name:iM.e.name,amount:iM.e.amount,isVariable:iM.e.isVariable}:{}} onSave={dt=>{iM.e?d({t:"UTI",aid:addr.id,cid:iM.cid,iid:iM.e.id,...dt}):d({t:"ATI",aid:addr.id,cid:iM.cid,...dt});setIM(null);}} t={t}/>}/>}
+    {gM&&<Modal title="🗂️ Gestionar Categorías" onClose={()=>setGM(false)} t={t} w="540px" ch={<CatManagerModal addr={addr} d={d} t={t} onClose={()=>setGM(false)}/>}/>}
     {cfm&&<Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>}
   </div>;
 }
@@ -584,10 +763,16 @@ function CatF({init,onSave,existing=[],t}){
 }
 
 function TmplItemF({init,onSave,t}){
-  const[name,setName]=useState(init.name||"");const[amount,setAmount]=useState(init.amount||0);const[isVariable,setIsVariable]=useState(init.isVariable||false);
+  const[name,setName]=useState(init.name||"");const[amount,setAmount]=useState(init.amount||0);const[isVariable,setIsVariable]=useState(init.isVariable||false);const[freq,setFreq]=useState(init.frequency||"mensual");
+  const mEq=Math.round((amount||0)*(MF[freq]||1));
   return <>
     <Fld label="Nombre del gasto" ch={<TI val={name} onChange={setName} ph="Arriendo, Luz, Internet, Agua, Netflix..." t={t}/>} t={t}/>
-    <Fld label={isVariable?"Monto estimado (referencia)":"Monto fijo mensual"} ch={<MoneyInput val={amount} onChange={setAmount} t={t} af/>} t={t}/>
+    <Fld label="Frecuencia de pago" ch={<Sel val={freq} onChange={setFreq} opts={FREQS.map(f=>({v:f.v,l:f.l}))} t={t}/>} t={t}/>
+    <Fld label={isVariable?"Monto estimado por pago":"Monto por pago"} ch={<MoneyInput val={amount} onChange={setAmount} t={t} af/>} t={t}/>
+    {freq!=="mensual"&&amount>0&&<div style={{padding:"0.5rem 0.75rem",background:t.info+"12",borderRadius:"0.5rem",marginBottom:"0.85rem",fontSize:"0.8rem",color:t.muted}}>
+      <span>Equivalente mensual: <strong style={{color:t.info}}>{new Intl.NumberFormat("es-CL",{style:"currency",currency:"CLP",maximumFractionDigits:0}).format(mEq)}</strong></span>
+      <span style={{marginLeft:"0.75rem"}}>· Anual: <strong style={{color:t.info}}>{new Intl.NumberFormat("es-CL",{style:"currency",currency:"CLP",maximumFractionDigits:0}).format(mEq*12)}</strong></span>
+    </div>}
     <label style={{display:"flex",alignItems:"flex-start",gap:"0.65rem",cursor:"pointer",padding:"0.65rem 0.75rem",background:t.card2,borderRadius:"0.5rem",marginBottom:"0.9rem"}}>
       <input type="checkbox" checked={isVariable} onChange={e=>setIsVariable(e.target.checked)} style={{width:"16px",height:"16px",accentColor:t.info,marginTop:"0.15rem"}}/>
       <div>
@@ -595,7 +780,7 @@ function TmplItemF({init,onSave,t}){
         <div style={{color:t.dim,fontSize:"0.73rem"}}>Marca esto si el monto cambia cada mes (luz, agua, teléfono). El monto que pones aquí es solo una estimación que puedes ajustar cuando pagas.</div>
       </div>
     </label>
-    <Btn onClick={()=>name&&onSave({name,amount,isVariable})} dis={!name} full icon={<Check size={14}/>}>{init.name?"Actualizar":"Agregar a plantilla"}</Btn>
+    <Btn onClick={()=>name&&onSave({name,amount,isVariable,frequency:freq})} dis={!name} full icon={<Check size={14}/>}>{init.name?"Actualizar":"Agregar a plantilla"}</Btn>
   </>;
 }
 
@@ -624,7 +809,7 @@ function HistorialView({s,d,t}){
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:"0.75rem",marginBottom:"1rem"}}>
       <StCard label="Presupuestado" val={fCLP(budget)} color={t.pri} icon={<Target size={16} color={t.pri}/>} t={t}/>
       <StCard label="Pagado" val={fCLP(paid)} color={t.ok} icon={<CheckCircle2 size={16} color={t.ok}/>} sub={`${paidItems.length+extras.length} pagos`} t={t}/>
-      <StCard label="Pendiente" val={fCLP(Math.max(0,budget-paidItems.reduce((s,i)=>s+(i.pay?.amount||0),0)))} color={t.err} icon={<Clock size={16} color={t.err}/>} sub={`${pending.length} ítems`} t={t}/>
+      <StCard label="Pendiente" val={fCLP(pending.reduce((s,i)=>s+Math.max(0,i.monthlyAmt-i.accumulated),0))} color={t.err} icon={<Clock size={16} color={t.err}/>} sub={`${pending.length} ítems`} t={t}/>
     </div>
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"1rem",marginBottom:"1rem",alignItems:"start"}}>
       {/* Calendario */}
@@ -674,20 +859,34 @@ function HistorialView({s,d,t}){
           <div style={{maxHeight:"200px",overflowY:"auto",display:"flex",flexDirection:"column",gap:"0.35rem"}}>
             {pending.map(it=><div key={it.id} style={{display:"flex",alignItems:"center",gap:"0.45rem",padding:"0.45rem 0.6rem",background:t.card2,borderRadius:"0.45rem",border:`1px solid ${t.border}`}}>
               <span style={{fontSize:"0.9rem",lineHeight:1}}>{it.catIcon||"📦"}</span>
-              <div style={{flex:1,minWidth:0}}><div style={{color:t.text,fontSize:"0.81rem",fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.name}</div><div style={{color:t.dim,fontSize:"0.68rem"}}>{it.catName}{it.isVariable?" · variable":""}</div></div>
-              <span style={{color:t.dim,fontSize:"0.78rem",whiteSpace:"nowrap"}}>{it.isVariable?"~":""}{fCLP(it.amount)}</span>
-              <Btn onClick={()=>setPayModal({date:todayStr(),isExtra:false,itemId:it.id,itemName:it.name,catName:it.catName,estimated:it.amount})} v="pri" sz="sm">Pagar</Btn>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{color:t.text,fontSize:"0.81rem",fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.name}</div>
+                <div style={{color:t.dim,fontSize:"0.68rem"}}>{it.catName}{it.isVariable?" · variable":""}{it.accumulated>0?` · abonado ${fCLP(it.accumulated)}`:""}</div>
+              </div>
+              <span style={{color:t.dim,fontSize:"0.78rem",whiteSpace:"nowrap"}}>{it.isVariable?"~":""}{fCLP(it.monthlyAmt)}</span>
+              <Btn onClick={()=>setPayModal({date:todayStr(),isExtra:false,itemId:it.id,itemName:it.name,catId:it.catId,catName:it.catName,estimated:it.monthlyAmt,remaining:it.monthlyAmt-it.accumulated,accumulated:it.accumulated})} v={it.accumulated>0?"out":"pri"} sz="sm">{it.accumulated>0?"+ Abonar":"Pagar"}</Btn>
             </div>)}
           </div>
         </>} t={t}/>}
         {(paidItems.length>0||extras.length>0)&&<CCard ch={<>
           <h4 style={{margin:"0 0 0.65rem",color:t.text,fontSize:"0.88rem",fontWeight:700}}>✅ Pagado</h4>
           <div style={{maxHeight:"200px",overflowY:"auto",display:"flex",flexDirection:"column",gap:"0.3rem"}}>
-            {paidItems.map(it=><div key={it.id} style={{display:"flex",alignItems:"center",gap:"0.45rem",padding:"0.4rem 0.6rem",background:t.ok+"10",borderRadius:"0.45rem",border:`1px solid ${t.ok}30`}}>
-              <CheckCircle2 size={13} color={t.ok}/>
-              <div style={{flex:1,minWidth:0}}><div style={{color:t.text,fontSize:"0.8rem",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.name}</div><div style={{color:t.dim,fontSize:"0.67rem"}}>{fmtDate(it.pay.date)}</div></div>
-              <span style={{color:t.ok,fontSize:"0.79rem",fontWeight:700,whiteSpace:"nowrap"}}>{fCLP(it.pay.amount)}</span>
-              <button onClick={()=>setCfm({msg:`¿Desmarcar "${it.name}"?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:it.pay.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.15rem",display:"flex"}}><RotateCcw size={11}/></button>
+            {paidItems.map(it=><div key={it.id} style={{padding:"0.4rem 0.6rem",background:t.ok+"10",borderRadius:"0.45rem",border:`1px solid ${t.ok}30`}}>
+              <div style={{display:"flex",alignItems:"center",gap:"0.45rem"}}>
+                {it.isPaid?<CheckCircle2 size={13} color={t.ok}/>:<Clock size={13} color={t.warn}/>}
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{color:t.text,fontSize:"0.8rem",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.name}{it.pays.length>1?` (${it.pays.length})`:""}</div>
+                  <div style={{color:t.dim,fontSize:"0.67rem"}}>{fmtDate(it.pays[it.pays.length-1]?.date)}</div>
+                </div>
+                <span style={{color:it.isPaid?t.ok:t.warn,fontSize:"0.79rem",fontWeight:700,whiteSpace:"nowrap"}}>{fCLP(it.accumulated)}{!it.isPaid?`/${fCLP(it.monthlyAmt)}`:""}</span>
+                {it.pays.length===1&&<button onClick={()=>setCfm({msg:`¿Desmarcar "${it.name}"?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:it.pays[0].id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.15rem",display:"flex"}}><RotateCcw size={11}/></button>}
+              </div>
+              {it.pays.length>1&&<div style={{marginLeft:"1.6rem",marginTop:"0.25rem",display:"flex",flexDirection:"column",gap:"0.15rem"}}>
+                {it.pays.map(p=><div key={p.id} style={{display:"flex",gap:"0.35rem",fontSize:"0.68rem",color:t.dim,alignItems:"center"}}>
+                  <span style={{flex:1}}>{fmtDate(p.date)}</span><span>{fCLP(p.amount)}</span>
+                  <button onClick={()=>setCfm({msg:`¿Eliminar este abono?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.1rem",display:"flex"}}><Trash2 size={9}/></button>
+                </div>)}
+              </div>}
             </div>)}
             {extras.map(p=><div key={p.id} style={{display:"flex",alignItems:"center",gap:"0.45rem",padding:"0.4rem 0.6rem",background:t.warn+"10",borderRadius:"0.45rem",border:`1px solid ${t.warn}30`}}>
               <Zap size={12} color={t.warn}/>
@@ -700,7 +899,7 @@ function HistorialView({s,d,t}){
         {pending.length===0&&paidItems.length===0&&extras.length===0&&<CCard ch={<Empty icon={<Calendar size={30}/>} title="Sin actividad este mes" sub='Marca gastos como pagados o agrega un pago extra.' t={t}/>} t={t}/>}
       </div>
     </div>
-    {payModal&&<PayModal state={payModal} t={t} onClose={()=>setPayModal(null)} catNames={catNames} onSave={dt=>{d({t:"ADD_PAY",aid:addr.id,d:dt});setPayModal(null);}}/>}
+    {payModal&&<PayModal state={payModal} t={t} addr={addr} d={d} onClose={()=>setPayModal(null)} onSave={dt=>{d({t:"ADD_PAY",aid:addr.id,d:dt});setPayModal(null);}}/>}
     {cfm&&<Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>}
   </div>;
 }
@@ -711,6 +910,7 @@ function AnalisisView({s,t}){
   const budget=addr?tmplTotal(addr):0;
   const recentMonths=useMemo(()=>{if(!addr)return[];const months=[];for(let i=11;i>=0;i--){let m=CM-i,y=CY;if(m<0){m+=12;y--;}months.push({year:y,month:m});}return months;},[addr]);
   const[sel,setSel]=useState(()=>new Set(recentMonths.map(m=>`${m.year}-${m.month}`)));
+  const[yearFilter,setYearFilter]=useState(null);
   const toggle=k=>setSel(p=>{const n=new Set(p);n.has(k)?n.delete(k):n.add(k);return n;});
   const selM=recentMonths.filter(m=>sel.has(`${m.year}-${m.month}`));
   const barData=selM.map(m=>{const p=addr?totalPaid(addr,m.year,m.month):0;const byCat={};(addr?mPays(addr,m.year,m.month):[]).forEach(pay=>{if(pay.catName)byCat[pay.catName]=(byCat[pay.catName]||0)+(pay.amount||0);});return{name:`${MESES[m.month].substr(0,3)} ${m.year}`,Presupuesto:budget,Pagado:p,...byCat};});
@@ -718,9 +918,38 @@ function AnalisisView({s,t}){
   const pieData=Object.entries(catAgg).map(([name,value])=>({name,value})).sort((a,b)=>b.value-a.value);
   const totalPaidAll=selM.reduce((s,m)=>s+(addr?totalPaid(addr,m.year,m.month):0),0);
 
-  const exportExcel=()=>{if(!addr||!selM.length)return;const wb=XLSX.utils.book_new();const sumRows=selM.map(m=>({"Período":`${MESES[m.month]} ${m.year}`,"Presupuestado":budget,"Pagado":totalPaid(addr,m.year,m.month),"Diferencia":totalPaid(addr,m.year,m.month)-budget}));XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(sumRows),"Resumen");selM.forEach(m=>{const rows=(addr?mPays(addr,m.year,m.month):[]).map(p=>({Nombre:p.name,Monto:p.amount,Fecha:p.date,Categoría:p.catName||"",Tipo:p.isExtra?"Extra":"Fijo",Método:p.method||""}));if(rows.length)XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(rows),`${MESES[m.month].substr(0,3)} ${m.year}`.replace(/[:\\/\[\]*?]/g,""));});XLSX.writeFile(wb,`gastos_${addr.name||"reporte"}_${new Date().toISOString().split("T")[0]}.xlsx`);};
+  const exportExcel=()=>{
+    if(!addr||!selM.length)return;
+    const wb=XLSX.utils.book_new();
+    const sumRows=selM.map(m=>({"Período":`${MESES[m.month]} ${m.year}`,"Presupuestado":budget,"Pagado":totalPaid(addr,m.year,m.month),"Diferencia":totalPaid(addr,m.year,m.month)-budget}));
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(sumRows),"Resumen");
+    // Hoja de gasto hormiga: agrupado por lugar/ítem con detalle de fechas
+    const agg={};
+    selM.forEach(m=>mPays(addr,m.year,m.month).filter(p=>p.isExtra).forEach(p=>{
+      const k=(p.name||"").trim().toLowerCase();if(!k)return;
+      agg[k]=agg[k]||{Lugar:p.name,Categoría:p.catName||"",Pagos:0,Total:0,detalle:[]};
+      agg[k].Pagos++;agg[k].Total+=p.amount||0;agg[k].detalle.push(`${fmtDate(p.date)}: ${fCLP(p.amount)}`);
+    }));
+    const hormigaRows=Object.values(agg).filter(e=>e.Pagos>=2).sort((a,b)=>b.Total-a.Total).map(e=>({Lugar:e.Lugar,Categoría:e.Categoría,"N° Pagos":e.Pagos,"Total Gastado":e.Total,"Detalle por Fecha":e.detalle.join(" | ")}));
+    if(hormigaRows.length)XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(hormigaRows),"Gasto Hormiga");
+    selM.forEach(m=>{const rows=(addr?mPays(addr,m.year,m.month):[]).map(p=>({Nombre:p.name,Monto:p.amount,Fecha:p.date,Categoría:p.catName||"",Tipo:p.isExtra?"Extra":"Fijo",Método:p.method||""}));if(rows.length)XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(rows),`${MESES[m.month].substr(0,3)} ${m.year}`.replace(/[:\\/\[\]*?]/g,""));});
+    XLSX.writeFile(wb,`gastos_${addr.name||"reporte"}_${new Date().toISOString().split("T")[0]}.xlsx`);
+  };
 
-  const exportPDF=()=>{if(!addr||!selM.length)return;const f=n=>fCLP(n);const html=`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Reporte</title><style>body{font-family:system-ui,sans-serif;padding:2rem;color:#1e293b;font-size:13px}h1{color:#7C3AED;font-size:22px}h2{font-size:14px;color:#334155;margin:1.5rem 0 .5rem;border-bottom:2px solid #e2e8f0;padding-bottom:4px}table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:1rem}th{background:#7C3AED;color:#fff;padding:6px 10px;text-align:left}td{padding:5px 10px;border-bottom:1px solid #f1f5f9}tr:nth-child(even) td{background:#f8fafc}</style></head><body><h1>📊 Reporte — ${addr.name}</h1><p style="color:#64748b;font-size:11px">Generado el ${new Date().toLocaleDateString("es-CL")} · Presupuesto mensual: ${f(budget)}</p><h2>Resumen mensual</h2><table><tr><th>Mes</th><th>Presupuestado</th><th>Pagado</th><th>Diferencia</th></tr>${selM.map(m=>{const p=totalPaid(addr,m.year,m.month);return`<tr><td>${MESES[m.month]} ${m.year}</td><td>${f(budget)}</td><td>${f(p)}</td><td style="color:${p>budget?"#ef4444":"#10b981"}">${p>budget?"+":""}${f(p-budget)}</td></tr>`;}).join("")}<tr style="font-weight:700;background:#ede9fe"><td>TOTAL</td><td>${f(budget*selM.length)}</td><td>${f(totalPaidAll)}</td><td>${f(totalPaidAll-budget*selM.length)}</td></tr></table>${selM.map(m=>{const pays=mPays(addr,m.year,m.month);if(!pays.length)return"";return`<h2>${MESES[m.month]} ${m.year} — ${f(totalPaid(addr,m.year,m.month))}</h2><table><tr><th>Nombre</th><th>Tipo</th><th>Categoría</th><th>Fecha</th><th>Monto</th></tr>${pays.map(p=>`<tr><td>${p.name}</td><td>${p.isExtra?"⚡":"✓"}</td><td>${p.catName||"—"}</td><td>${fmtDate(p.date)}</td><td>${f(p.amount)}</td></tr>`).join("")}</table>`;}).join("")}</body></html>`;const w=window.open("","_blank");if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),500);}};
+  const exportPDF=()=>{
+    if(!addr||!selM.length)return;
+    const f=n=>fCLP(n);
+    const hAgg={};
+    selM.forEach(m=>mPays(addr,m.year,m.month).filter(p=>p.isExtra).forEach(p=>{
+      const k=(p.name||"").trim().toLowerCase();if(!k)return;
+      hAgg[k]=hAgg[k]||{name:p.name,cat:p.catName||"",count:0,total:0,det:[]};
+      hAgg[k].count++;hAgg[k].total+=p.amount||0;hAgg[k].det.push(`${fmtDate(p.date)}: ${f(p.amount)}`);
+    }));
+    const hormiga=Object.values(hAgg).filter(e=>e.count>=2).sort((a,b)=>b.total-a.total);
+    const hormigaHTML=hormiga.length?`<h2>🐜 Gastos Frecuentes No Planificados (posible gasto hormiga)</h2><table><tr><th>Lugar/Ítem</th><th>Categoría</th><th>N° Pagos</th><th>Total</th><th>Detalle por fecha</th></tr>${hormiga.map(e=>`<tr><td>${e.name}</td><td>${e.cat||"—"}</td><td>${e.count}</td><td>${f(e.total)}</td><td style="font-size:10px">${e.det.join(", ")}</td></tr>`).join("")}</table>`:"";
+    const html=`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Reporte</title><style>body{font-family:system-ui,sans-serif;padding:2rem;color:#1e293b;font-size:13px}h1{color:#7C3AED;font-size:22px}h2{font-size:14px;color:#334155;margin:1.5rem 0 .5rem;border-bottom:2px solid #e2e8f0;padding-bottom:4px}table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:1rem}th{background:#7C3AED;color:#fff;padding:6px 10px;text-align:left}td{padding:5px 10px;border-bottom:1px solid #f1f5f9}tr:nth-child(even) td{background:#f8fafc}</style></head><body><h1>📊 Reporte — ${addr.name}</h1><p style="color:#64748b;font-size:11px">Generado el ${new Date().toLocaleDateString("es-CL")} · Presupuesto mensual: ${f(budget)}</p><h2>Resumen mensual</h2><table><tr><th>Mes</th><th>Presupuestado</th><th>Pagado</th><th>Diferencia</th></tr>${selM.map(m=>{const p=totalPaid(addr,m.year,m.month);return`<tr><td>${MESES[m.month]} ${m.year}</td><td>${f(budget)}</td><td>${f(p)}</td><td style="color:${p>budget?"#ef4444":"#10b981"}">${p>budget?"+":""}${f(p-budget)}</td></tr>`;}).join("")}<tr style="font-weight:700;background:#ede9fe"><td>TOTAL</td><td>${f(budget*selM.length)}</td><td>${f(totalPaidAll)}</td><td>${f(totalPaidAll-budget*selM.length)}</td></tr></table>${hormigaHTML}${selM.map(m=>{const pays=mPays(addr,m.year,m.month);if(!pays.length)return"";return`<h2>${MESES[m.month]} ${m.year} — ${f(totalPaid(addr,m.year,m.month))}</h2><table><tr><th>Nombre</th><th>Tipo</th><th>Categoría</th><th>Fecha</th><th>Monto</th></tr>${pays.map(p=>`<tr><td>${p.name}</td><td>${p.isExtra?"⚡":"✓"}</td><td>${p.catName||"—"}</td><td>${fmtDate(p.date)}</td><td>${f(p.amount)}</td></tr>`).join("")}</table>`;}).join("")}</body></html>`;
+    const w=window.open("","_blank");if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),500);}
+  };
 
   if(!addr)return <CCard ch={<Empty icon={<Building2 size={36}/>} title="Sin dirección" sub="Configura una dirección en Gastos Fijos para ver el análisis." t={t}/>} t={t}/>;
 
@@ -730,10 +959,20 @@ function AnalisisView({s,t}){
     <CCard ch={<>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"0.65rem",flexWrap:"wrap",gap:"0.4rem"}}>
         <span style={{color:t.text,fontWeight:700,fontSize:"0.87rem"}}>Meses a analizar ({selM.length}/{recentMonths.length})</span>
-        <div style={{display:"flex",gap:"0.35rem"}}>
-          <Btn onClick={()=>setSel(new Set(recentMonths.map(m=>`${m.year}-${m.month}`)))} v="ghost" sz="sm">Todos</Btn>
+        <div style={{display:"flex",gap:"0.35rem",flexWrap:"wrap"}}>
+          <Btn onClick={()=>{setYearFilter(null);setSel(new Set(recentMonths.map(m=>`${m.year}-${m.month}`)));}} v="ghost" sz="sm">Todos</Btn>
+          <Btn onClick={()=>{setYearFilter(CY);setSel(new Set(recentMonths.filter(m=>m.year===CY).map(m=>`${m.year}-${m.month}`)));}} v="ghost" sz="sm">Este año</Btn>
+          <Btn onClick={()=>setSel(new Set([`${CY}-${CM}`]))} v="ghost" sz="sm">Este mes</Btn>
           <Btn onClick={()=>setSel(new Set(recentMonths.slice(-3).map(m=>`${m.year}-${m.month}`)))} v="ghost" sz="sm">Últ. 3</Btn>
           <Btn onClick={()=>setSel(new Set(recentMonths.slice(-6).map(m=>`${m.year}-${m.month}`)))} v="ghost" sz="sm">Últ. 6</Btn>
+          <Btn onClick={()=>setSel(new Set(recentMonths.slice(-12).map(m=>`${m.year}-${m.month}`)))} v="ghost" sz="sm">Últ. 12</Btn>
+        </div>
+        <div style={{display:"flex",gap:"0.5rem",marginTop:"0.5rem",alignItems:"center"}}>
+          <span style={{color:t.muted,fontSize:"0.75rem"}}>Filtrar por año:</span>
+          <select value={yearFilter||""} onChange={e=>{const y=e.target.value?+e.target.value:null;setYearFilter(y);if(y)setSel(new Set(recentMonths.filter(m=>m.year===y).map(m=>`${m.year}-${m.month}`)));}} style={{padding:"0.25rem 0.5rem",background:t.card2,border:`1px solid ${t.border}`,borderRadius:"0.4rem",color:t.text,fontSize:"0.78rem"}}>
+            <option value="">Todos</option>
+            {[...new Set(recentMonths.map(m=>m.year))].sort((a,b)=>b-a).map(y=><option key={y} value={y}>{y}</option>)}
+          </select>
         </div>
       </div>
       <div style={{display:"flex",flexWrap:"wrap",gap:"0.35rem"}}>
@@ -797,7 +1036,7 @@ function PerfilView({s,d,t}){
         <Btn onClick={()=>setShowAK(p=>!p)} v="ghost" sz="sm">{apiKey?(showAK?"Ocultar":"Cambiar"):"Agregar"}</Btn>
       </div>
       {(!apiKey||showAK)&&<>
-        {!apiKey&&<p style={{color:t.muted,fontSize:"0.82rem",margin:"0 0 0.75rem",lineHeight:1.5}}>Para usar la IA necesitas una key gratuita de Anthropic. <a href="https://console.anthropic.com" target="_blank" style={{color:t.pri}}>Obtener →</a></p>}
+        {!apiKey&&<p style={{color:t.muted,fontSize:"0.82rem",margin:"0 0 0.75rem",lineHeight:1.5}}>Para usar la IA necesitas una key gratuita de Anthropic. <a href="https://platform.claude.com" target="_blank" style={{color:t.pri}}>Obtener →</a> · Hay una guía paso a paso en la pestaña <strong style={{color:t.text}}>Plan IA</strong>.</p>}
         <Fld label="API Key (sk-ant-...)" ch={<TI val={apiKey} onChange={k=>{setApiKey(k);saveAK(k);}} ph="sk-ant-api03-..." t={t} type="password"/>} t={t}/>
         {apiKey&&<Btn onClick={()=>setShowAK(false)} v="ok" sz="sm" icon={<Check size={12}/>}>Guardar</Btn>}
       </>}
@@ -851,8 +1090,21 @@ function PerfilView({s,d,t}){
     </>} t={t} sx={{marginBottom:"1rem"}}/>
     {/* Export/Import — identidad de datos */}
     <CCard ch={<>
-      <h4 style={{margin:"0 0 0.5rem",color:t.text,fontSize:"0.9rem",fontWeight:700}}>💾 Mis datos — Respaldo y restauración</h4>
-      <p style={{color:t.muted,fontSize:"0.82rem",margin:"0 0 0.85rem",lineHeight:1.5}}>Tus datos viven en <strong style={{color:t.text}}>este navegador</strong>. Expórtalos como respaldo y recupéralos si cambias de dispositivo o borras el caché del navegador.</p>
+      <h4 style={{margin:"0 0 0.75rem",color:t.text,fontSize:"0.9rem",fontWeight:700}}>💾 Mis datos — Respaldo y restauración</h4>
+      <div style={{display:"flex",gap:"0.6rem",padding:"0.7rem 0.85rem",background:t.err+"13",border:`1px solid ${t.err}45`,borderRadius:"0.55rem",marginBottom:"0.85rem"}}>
+        <span style={{fontSize:"1.2rem",lineHeight:1.2,flexShrink:0}}>⚠️</span>
+        <div>
+          <div style={{color:t.err,fontWeight:700,fontSize:"0.84rem",marginBottom:"0.3rem"}}>¡Atención! Riesgo de pérdida de datos</div>
+          <div style={{color:t.muted,fontSize:"0.79rem",lineHeight:1.55}}>
+            Tus datos viven solo en <strong style={{color:t.text}}>este navegador</strong>. Estas acciones los borran permanentemente:<br/>
+            • <strong style={{color:t.text}}>Borrar datos/caché del navegador</strong> (Configuración → Privacidad)<br/>
+            • <strong style={{color:t.text}}>"Limpiar datos de sitios"</strong> en Chrome/Firefox<br/>
+            • <strong style={{color:t.text}}>Modo incógnito/privado</strong> (se pierden al cerrar la ventana)<br/>
+            • <strong style={{color:t.text}}>Reinstalar o cambiar de navegador</strong><br/><br/>
+            👉 <strong style={{color:t.text}}>Exporta un respaldo regularmente</strong>, sobre todo antes de actualizar o limpiar el navegador.
+          </div>
+        </div>
+      </div>
       <div style={{display:"flex",gap:"0.65rem",flexWrap:"wrap"}}>
         <Btn onClick={exportData} v="out" icon={<Download size={14}/>}>Exportar respaldo (JSON)</Btn>
         <label style={{display:"flex",alignItems:"center",gap:"0.4rem",padding:"0.5rem 1rem",background:"transparent",color:"inherit",border:"1px solid #94A3B8",borderRadius:"0.5rem",cursor:"pointer",fontWeight:600,fontSize:"0.85rem"}}>
@@ -892,6 +1144,165 @@ function GoalF({onSave,t}){
 }
 
 /* ══ IA ══════════════════════════════════════════════════ */
+/* ══ GUÍA DE CONFIGURACIÓN API KEY ═══════════════════════
+   Nota de honestidad: solo podemos detectar mecánicamente si YA hay
+   una key guardada en este navegador (apiKey presente/ausente).
+   No hay forma de saber si la persona ya tiene cuenta en Anthropic
+   antes de que pegue su key — por eso el mensaje lo aclara y deja
+   la puerta abierta a "ya tengo mi key" en todo momento.
+══════════════════════════════════════════════════════════ */
+function MockBrowser({t,url,ch}){
+  return <div style={{border:`1px solid ${t.border}`,borderRadius:"0.6rem",overflow:"hidden",background:t.card2,margin:"0.6rem 0"}}>
+    <div style={{display:"flex",alignItems:"center",gap:"0.4rem",padding:"0.4rem 0.6rem",background:t.card3,borderBottom:`1px solid ${t.border}`}}>
+      <div style={{display:"flex",gap:"0.25rem"}}>{["#EF4444","#F59E0B","#10B981"].map(c=><div key={c} style={{width:"7px",height:"7px",borderRadius:"50%",background:c}}/>)}</div>
+      <div style={{flex:1,background:t.card,borderRadius:"0.3rem",padding:"0.15rem 0.5rem",color:t.dim,fontSize:"0.68rem",textAlign:"center"}}>{url}</div>
+    </div>
+    <div style={{padding:"0.9rem"}}>{ch}</div>
+  </div>;
+}
+const QUICK_STEPS=[
+  {ic:"👤",lb:"Crear cuenta",sub:"platform.claude.com"},
+  {ic:"🔑",lb:"Crear API Key",sub:"Settings → API Keys"},
+  {ic:"📋",lb:"Copiar la key",sub:"empieza con sk-ant-"},
+  {ic:"💳",lb:"Cargar crédito",sub:"desde $1.000 CLP"},
+  {ic:"📌",lb:"Pegar aquí",sub:"¡y listo!"},
+];
+function DETAIL_STEPS(t){return[
+  {e:"👋",time:"1 min",title:"¿Qué vamos a hacer?",desc:<>
+    <p style={{margin:"0 0 0.6rem",lineHeight:1.65}}>Vamos a crear tu propia llave de acceso ("API key") para que la sección Plan IA pueda funcionar. Es gratuita de crear y tú controlas cuánto gastas — nunca se cobra nada sin que tú cargues crédito primero.</p>
+    <p style={{margin:0,lineHeight:1.65}}>Son 5 pasos, toma unos 5 minutos la primera vez. Puedes omitir esto en cualquier momento con el botón de arriba.</p>
+  </>},
+  {e:"👤",time:"~2 min",title:"1. Crea tu cuenta",desc:<>
+    <p style={{margin:"0 0 0.4rem",lineHeight:1.6}}>Ve a <strong style={{color:t.text}}>platform.claude.com</strong> y crea una cuenta gratis con tu correo o con Google. Esto es distinto de una cuenta de Claude.ai (el chat) — es el panel para desarrolladores, pero cualquier persona puede usarlo.</p>
+    <MockBrowser t={t} url="platform.claude.com/signup" ch={<div style={{display:"flex",flexDirection:"column",gap:"0.4rem",alignItems:"center"}}>
+      <div style={{fontSize:"0.78rem",color:t.muted,marginBottom:"0.2rem"}}>Crear cuenta</div>
+      <div style={{width:"85%",padding:"0.35rem",background:t.card,border:`1px solid ${t.border}`,borderRadius:"0.35rem",fontSize:"0.72rem",color:t.dim,textAlign:"center"}}>🔵 Continuar con Google</div>
+      <div style={{width:"85%",padding:"0.35rem",background:t.card,border:`1px solid ${t.border}`,borderRadius:"0.35rem",fontSize:"0.72rem",color:t.dim,textAlign:"center"}}>✉️ correo@ejemplo.com</div>
+    </div>}/>
+    <p style={{margin:0,color:t.dim,fontSize:"0.73rem",fontStyle:"italic"}}>Ilustración simplificada — la interfaz real puede verse distinta.</p>
+  </>},
+  {e:"✉️",time:"~1 min",title:"2. Verifica tu correo",desc:<>
+    <p style={{margin:0,lineHeight:1.6}}>Te llegará un correo de confirmación. Ábrelo y haz click en el link de verificación. Con eso tu cuenta queda activa — todavía no has gastado ni cargado nada.</p>
+  </>},
+  {e:"🔑",time:"~1 min",title:"3. Crea tu API Key",desc:<>
+    <p style={{margin:"0 0 0.4rem",lineHeight:1.6}}>Dentro del panel, ve a <strong style={{color:t.text}}>Settings → API Keys</strong> y haz click en <strong style={{color:t.text}}>"Create Key"</strong>. Puedes ponerle el nombre que quieras, por ejemplo "GestorGastos".</p>
+    <MockBrowser t={t} url="platform.claude.com/settings/keys" ch={<div style={{display:"flex",flexDirection:"column",gap:"0.35rem"}}>
+      <div style={{fontSize:"0.72rem",color:t.muted}}>API Keys</div>
+      <div style={{display:"flex",justifyContent:"flex-end"}}><div style={{padding:"0.3rem 0.6rem",background:t.pri,color:"#fff",borderRadius:"0.3rem",fontSize:"0.7rem",fontWeight:700}}>+ Create Key</div></div>
+    </div>}/>
+  </>},
+  {e:"📋",time:"~1 min",title:"4. Copia y guarda la key",desc:<>
+    <p style={{margin:"0 0 0.5rem",lineHeight:1.6}}>Va a aparecer una key larga que empieza con <code style={{background:t.card2,padding:"0.1rem 0.35rem",borderRadius:"0.25rem",color:t.pri}}>sk-ant-...</code>. </p>
+    <div style={{display:"flex",gap:"0.5rem",padding:"0.6rem 0.75rem",background:t.warn+"12",border:`1px solid ${t.warn}40`,borderRadius:"0.5rem"}}>
+      <AlertTriangle size={14} color={t.warn} style={{flexShrink:0,marginTop:"0.1rem"}}/>
+      <span style={{fontSize:"0.79rem",color:t.muted,lineHeight:1.5}}><strong style={{color:t.text}}>Solo se muestra una vez.</strong> Cópiala altiro. Trátala como una contraseña: no la compartas con nadie ni la publiques en redes o repositorios.</span>
+    </div>
+  </>},
+  {e:"💳",time:"~2 min",title:"5. Cargar crédito (sin sorpresas)",desc:<>
+    <p style={{margin:"0 0 0.6rem",lineHeight:1.6}}>El sistema funciona con <strong style={{color:t.text}}>saldo prepago</strong>: cargas un monto, y solo se descuenta de ahí. Algunas cuentas reciben un crédito de regalo (no está garantizado en todos los países) — si aparece, genial; si no, puedes cargar tú mismo desde muy poco.</p>
+    <div style={{padding:"0.7rem 0.85rem",background:t.pri+"10",border:`1px solid ${t.pri}30`,borderRadius:"0.55rem",marginBottom:"0.6rem"}}>
+      <div style={{color:t.pri,fontWeight:700,fontSize:"0.8rem",marginBottom:"0.4rem"}}>💰 ¿Cuánto cuesta realmente usar el Plan IA acá?</div>
+      <div style={{color:t.muted,fontSize:"0.78rem",lineHeight:1.7}}>
+        Esta app usa el modelo Sonnet 4.6 (~$3 USD por millón de palabras leídas, ~$15 USD por millón generadas).<br/>
+        → Cada plan que generas cuesta aprox. <strong style={{color:t.text}}>$15-20 CLP</strong> (menos de un peso... bueno, menos de 20).<br/>
+        → Con <strong style={{color:t.text}}>$1.000 CLP</strong> cargados alcanzas para <strong style={{color:t.text}}>+50 planes</strong>.<br/>
+        <span style={{fontSize:"0.71rem",color:t.dim}}>Precios de referencia (jul. 2026) — pueden cambiar; el valor exacto siempre está en Billing → Cost de tu cuenta.</span>
+      </div>
+    </div>
+    <div style={{color:t.text,fontWeight:700,fontSize:"0.82rem",marginBottom:"0.4rem"}}>Para no gastar de más:</div>
+    <ul style={{margin:0,paddingLeft:"1.1rem",color:t.muted,fontSize:"0.79rem",lineHeight:1.85}}>
+      <li><strong style={{color:t.text}}>No actives "recarga automática"</strong> — así jamás gastas más de lo que cargaste a propósito.</li>
+      <li>Carga un monto chico para partir (con $5.000-$10.000 CLP tienes para meses de uso normal).</li>
+      <li>Puedes poner además un tope mensual en Billing → Limits, como respaldo extra.</li>
+      <li>Revisa tu gasto real cuando quieras en Billing → Cost.</li>
+    </ul>
+  </>},
+  {e:"📌",time:"~1 min",title:"6. Pega tu key aquí y listo",desc:<>
+    <p style={{margin:0,lineHeight:1.6}}>Vuelve a esta pestaña, pega tu key en el campo de abajo (o en tu Perfil) y guarda. Se queda guardada solo en este navegador — nunca se envía a ningún servidor nuestro.</p>
+  </>},
+];}
+function QuickGuide({t,onDetail,onSkip,onNeverShow,apiKey,setApiKey}){
+  const[kv,setKv]=useState("");
+  return <CCard t={t} sx={{marginBottom:"1rem"}} ch={<>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"0.9rem"}}>
+      <span style={{color:t.text,fontWeight:800,fontSize:"0.95rem"}}>🔑 Configura tu acceso a la IA</span>
+      <button onClick={onSkip} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,fontSize:"0.78rem",padding:"0.2rem 0.4rem"}}>Omitir ✕</button>
+    </div>
+    <p style={{margin:"0 0 0.9rem",color:t.muted,fontSize:"0.81rem",lineHeight:1.55}}>No podemos saber si ya tienes cuenta en Anthropic — pero si ya tienes tu key, pégala directo abajo. Si no, estos son los pasos:</p>
+    <div style={{display:"flex",flexWrap:"wrap",alignItems:"center",gap:"0.2rem",marginBottom:"1rem",justifyContent:"center"}}>
+      {QUICK_STEPS.flatMap((st,i)=>[
+        <div key={`s${i}`} style={{display:"flex",flexDirection:"column",alignItems:"center",width:"84px",textAlign:"center"}}>
+          <div style={{width:"38px",height:"38px",borderRadius:"50%",background:t.card2,border:`1px solid ${t.border}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"1.1rem",marginBottom:"0.3rem"}}>{st.ic}</div>
+          <div style={{color:t.text,fontSize:"0.68rem",fontWeight:700,lineHeight:1.2}}>{st.lb}</div>
+          <div style={{color:t.dim,fontSize:"0.62rem",marginTop:"0.1rem"}}>{st.sub}</div>
+        </div>,
+        i<QUICK_STEPS.length-1?<ChevronRight key={`a${i}`} size={14} color={t.dim} style={{flexShrink:0,marginTop:"-1.1rem"}}/>:null
+      ])}
+    </div>
+    <div style={{display:"flex",gap:"0.5rem",marginBottom:"1rem",flexWrap:"wrap"}}>
+      <Btn onClick={onDetail} v="out" sz="sm" icon={<BookOpen size={13}/>}>Ver guía detallada paso a paso</Btn>
+      <a href="https://platform.claude.com" target="_blank" style={{fontSize:"0.79rem",color:t.pri,display:"flex",alignItems:"center",gap:"0.25rem"}}>Ir a platform.claude.com <ArrowRight size={12}/></a>
+    </div>
+    <div style={{borderTop:`1px solid ${t.border}`,paddingTop:"0.85rem"}}>
+      <div style={{color:t.text,fontWeight:700,fontSize:"0.82rem",marginBottom:"0.5rem"}}>¿Ya tienes tu key? Pégala aquí:</div>
+      <div style={{display:"flex",gap:"0.5rem"}}>
+        <TI val={kv} onChange={setKv} ph="sk-ant-api03-..." t={t} type="password"/>
+        <Btn onClick={()=>{if(kv){setApiKey(kv);saveAK(kv);}}} dis={!kv} icon={<Check size={13}/>}>Guardar</Btn>
+      </div>
+    </div>
+    <button onClick={onNeverShow} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,fontSize:"0.72rem",padding:"0.6rem 0 0",textDecoration:"underline"}}>No mostrar esta guía de nuevo</button>
+  </>}/>;
+}
+function DetailGuide({t,onBack,onSkip,onNeverShow,apiKey,setApiKey}){
+  const[step,setStep]=useState(0);
+  const STEPS=DETAIL_STEPS(t);
+  const cur=STEPS[step],isLast=step===STEPS.length-1;
+  const[kv,setKv]=useState("");
+  return <CCard t={t} sx={{marginBottom:"1rem"}} ch={<>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"0.75rem"}}>
+      <button onClick={onBack} style={{background:"none",border:"none",cursor:"pointer",color:t.muted,fontSize:"0.78rem",display:"flex",alignItems:"center",gap:"0.25rem",padding:"0.2rem"}}><ChevronLeft size={13}/> Volver al resumen</button>
+      <button onClick={onSkip} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,fontSize:"0.78rem",padding:"0.2rem 0.4rem"}}>Omitir ✕</button>
+    </div>
+    <div style={{display:"flex",justifyContent:"center",gap:"0.3rem",marginBottom:"1rem"}}>
+      {STEPS.map((_,i)=><div key={i} style={{width:i===step?"18px":"6px",height:"6px",borderRadius:"3px",background:i===step?t.pri:t.border,transition:"all .3s"}}/>)}
+    </div>
+    <div style={{textAlign:"center",marginBottom:"0.4rem"}}>
+      <div style={{fontSize:"2.2rem",marginBottom:"0.4rem",lineHeight:1}}>{cur.e}</div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:"0.5rem",marginBottom:"0.7rem"}}>
+        <h3 style={{margin:0,color:t.text,fontSize:"1.05rem",fontWeight:800}}>{cur.title}</h3>
+        <Badge ch={`⏱ ${cur.time}`} color={t.info}/>
+      </div>
+    </div>
+    <div style={{textAlign:"left",marginBottom:"1rem"}}>{cur.desc}</div>
+    {isLast&&<div style={{borderTop:`1px solid ${t.border}`,paddingTop:"0.85rem",marginBottom:"0.75rem"}}>
+      <div style={{display:"flex",gap:"0.5rem"}}>
+        <TI val={kv} onChange={setKv} ph="sk-ant-api03-..." t={t} type="password"/>
+        <Btn onClick={()=>{if(kv){setApiKey(kv);saveAK(kv);}}} dis={!kv} icon={<Check size={13}/>}>Guardar</Btn>
+      </div>
+    </div>}
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+      <Btn onClick={()=>setStep(p=>Math.max(0,p-1))} v="ghost" sz="sm" dis={step===0} icon={<ChevronLeft size={13}/>}>Anterior</Btn>
+      <span style={{color:t.dim,fontSize:"0.72rem"}}>{step+1}/{STEPS.length}</span>
+      {!isLast?<Btn onClick={()=>setStep(p=>p+1)} sz="sm">Siguiente →</Btn>:<Btn onClick={onBack} v="ok" sz="sm" icon={<Check size={13}/>}>Listo</Btn>}
+    </div>
+    <button onClick={onNeverShow} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,fontSize:"0.72rem",padding:"0.75rem 0 0",textDecoration:"underline",display:"block",margin:"0.75rem auto 0"}}>No mostrar esta guía de nuevo</button>
+  </>}/>;
+}
+function MinimalKeyPrompt({t,onShowGuide,apiKey,setApiKey}){
+  const[kv,setKv]=useState("");
+  return <CCard t={t} sx={{marginBottom:"1rem"}} ch={<div style={{display:"flex",gap:"0.75rem",alignItems:"flex-start"}}>
+    <div style={{fontSize:"1.4rem"}}>🔑</div>
+    <div style={{flex:1}}>
+      <div style={{color:t.text,fontWeight:700,fontSize:"0.87rem",marginBottom:"0.35rem"}}>Necesitas una API key para usar la IA</div>
+      <div style={{display:"flex",gap:"0.5rem",marginBottom:"0.5rem"}}>
+        <TI val={kv} onChange={setKv} ph="Pega tu key: sk-ant-api03-..." t={t} type="password"/>
+        <Btn onClick={()=>{if(kv){setApiKey(kv);saveAK(kv);}}} dis={!kv} sz="sm" icon={<Check size={13}/>}>Guardar</Btn>
+      </div>
+      <button onClick={onShowGuide} style={{background:"none",border:"none",cursor:"pointer",color:t.pri,fontSize:"0.78rem",padding:0}}>📖 ¿Cómo obtengo mi key? Ver guía paso a paso</button>
+    </div>
+  </div>}/>;
+}
+
 const PLANS=[
   {id:"ahorro",e:"💰",label:"Plan de Ahorro",desc:"Estrategia para maximizar ahorros"},
   {id:"diagnostico",e:"🔍",label:"Diagnóstico",desc:"Análisis detallado de mis gastos"},
@@ -903,6 +1314,8 @@ const PLANS=[
 function IAView({s,d,t}){
   const[loading,setLoading]=useState(false);const[resp,setResp]=useState("");const[plan,setPlan]=useState("ahorro");const[cQ,setCQ]=useState("");
   const[useProf,setUseProf]=useState(true);const[showHist,setShowHist]=useState(false);const[apiKey,setApiKey]=useState(getAK);
+  const[guideView,setGuideView]=useState(()=>(!getAK()&&!s.settings.iaGuideDismissed)?"quick":null);
+  useEffect(()=>{if(apiKey)setGuideView(null);},[apiKey]);
   const addr=s.addresses.find(a=>a.id===s.selAddr);
   const budget=addr?tmplTotal(addr):0;
   const recMonths=useMemo(()=>{if(!addr)return[];const months=[];for(let i=2;i>=0;i--){let m=CM-i,y=CY;if(m<0){m+=12;y--;}months.push({year:y,month:m});}return months;},[addr]);
@@ -911,8 +1324,20 @@ function IAView({s,d,t}){
     if(addr){
       c+=`\n\n### PLANTILLA DE GASTOS FIJOS:\nPresupuesto mensual total: ${fCLP(budget)}\n`;
       (addr.template?.categories||[]).forEach(cat=>{c+=`\nCategoría ${cat.name}:\n`;(cat.items||[]).forEach(it=>c+=`- ${it.name}: ${fCLP(it.amount)}${it.isVariable?" (variable)":""}\n`);});
-      c+="\n### PAGOS REALES RECIENTES:\n";
-      recMonths.forEach(m=>{const pays=mPays(addr,m.year,m.month);if(pays.length){c+=`\n${MESES[m.month]} ${m.year} (Total: ${fCLP(totalPaid(addr,m.year,m.month))}, Presupuesto: ${fCLP(budget)}):\n`;pays.forEach(p=>c+=`- ${p.name}: ${fCLP(p.amount)} (${p.isExtra?"extra":"fijo"}${p.catName?`, ${p.catName}`:""})\n`);}});
+      c+="\n### PAGOS REALES RECIENTES (con fecha):\n";
+      recMonths.forEach(m=>{const pays=mPays(addr,m.year,m.month);if(pays.length){c+=`\n${MESES[m.month]} ${m.year} (Total: ${fCLP(totalPaid(addr,m.year,m.month))}, Presupuesto: ${fCLP(budget)}):\n`;pays.forEach(p=>c+=`- ${fmtDate(p.date)}: ${p.name} — ${fCLP(p.amount)} (${p.isExtra?"extra":"fijo"}${p.catName?`, ${p.catName}`:""})\n`);}});
+      // Agregación de gasto hormiga: compras chicas y repetidas en el mismo lugar/ítem
+      const extraAgg={};
+      recMonths.forEach(m=>mPays(addr,m.year,m.month).filter(p=>p.isExtra).forEach(p=>{
+        const k=(p.name||"").trim().toLowerCase();if(!k)return;
+        extraAgg[k]=extraAgg[k]||{name:p.name,total:0,count:0,dates:[]};
+        extraAgg[k].total+=p.amount||0;extraAgg[k].count++;extraAgg[k].dates.push(`${fmtDate(p.date)}: ${fCLP(p.amount)}`);
+      }));
+      const hormiga=Object.values(extraAgg).filter(e=>e.count>=2).sort((a,b)=>b.total-a.total);
+      if(hormiga.length){
+        c+="\n### GASTOS RECURRENTES NO PLANIFICADOS AGRUPADOS (posible gasto hormiga — analiza si conviene comprar todo junto en vez de de a poco):\n";
+        hormiga.forEach(e=>c+=`- ${e.name}: ${e.count} pagos, total ${fCLP(e.total)} · detalle: ${e.dates.join(", ")}\n`);
+      }
     }
     if(useProf&&s.profile){
       const p=s.profile;c+="\n### PERFIL:\n";
@@ -932,7 +1357,7 @@ function IAView({s,d,t}){
     if(plan==="libre"&&!cQ.trim())return;
     setLoading(true);setResp("");
     try{
-      const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,system:"Eres un asesor financiero personal experto en la economía chilena 2025. Consejos prácticos, directos y accionables. Conoces AFP, Fonasa/Isapre, becas MINEDUC, precios en Chile. Usas método 50/30/20 y literatura económica real. Respondes en español chileno con estructura clara y emojis. Eres honesto y realista. Finaliza siempre con sección 'Próximos pasos concretos' enumerados.",messages:[{role:"user",content:`${ASKS[plan]}${ctx()}`}]})});
+      const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,system:"Eres un asesor financiero personal experto en la economía chilena 2025. Consejos prácticos, directos y accionables. Conoces AFP, Fonasa/Isapre, becas MINEDUC, precios en Chile. Usas método 50/30/20 y literatura económica real. Si ves la sección GASTOS RECURRENTES NO PLANIFICADOS AGRUPADOS, coméntala explícitamente: son compras chicas y repetidas (gasto hormiga) — analiza si comprar en volumen o cambiar de lugar convendría más. Respondes en español chileno con estructura clara y emojis. Eres honesto y realista. Finaliza siempre con sección 'Próximos pasos concretos' enumerados.",messages:[{role:"user",content:`${ASKS[plan]}${ctx()}`}]})});
       const data=await r.json();
       const text=data.content?.[0]?.text||"Sin respuesta.";
       setResp(text);d({t:"ADAI",d:{planType:plan,response:text}});
@@ -943,11 +1368,15 @@ function IAView({s,d,t}){
 
   return <div>
     <SH title="Planificación IA" sub="Asesor financiero para la realidad chilena" t={t}/>
-    {!apiKey&&<CCard ch={<div style={{display:"flex",gap:"0.75rem",alignItems:"flex-start"}}>
-      <div style={{fontSize:"1.5rem"}}>🔑</div>
-      <div><div style={{color:t.text,fontWeight:700,fontSize:"0.9rem",marginBottom:"0.3rem"}}>Necesitas una API key de Anthropic</div>
-      <p style={{color:t.muted,fontSize:"0.82rem",margin:"0 0 0.75rem",lineHeight:1.5}}>Es gratis para empezar. Obtén tu key en <a href="https://console.anthropic.com" target="_blank" style={{color:t.pri}}>console.anthropic.com</a> y agrégala en Perfil.</p></div>
-    </div>} t={t} sx={{marginBottom:"1rem"}}/>}
+    {!apiKey&&guideView==="quick"&&<QuickGuide t={t} apiKey={apiKey} setApiKey={setApiKey}
+      onDetail={()=>setGuideView("detail")}
+      onSkip={()=>setGuideView(null)}
+      onNeverShow={()=>{d({t:"SS",k:"iaGuideDismissed",v:true});setGuideView(null);}}/>}
+    {!apiKey&&guideView==="detail"&&<DetailGuide t={t} apiKey={apiKey} setApiKey={setApiKey}
+      onBack={()=>setGuideView("quick")}
+      onSkip={()=>setGuideView(null)}
+      onNeverShow={()=>{d({t:"SS",k:"iaGuideDismissed",v:true});setGuideView(null);}}/>}
+    {!apiKey&&guideView===null&&<MinimalKeyPrompt t={t} apiKey={apiKey} setApiKey={setApiKey} onShowGuide={()=>setGuideView("quick")}/>}
     {addr&&budget>0&&<div style={{padding:"0.55rem 0.75rem",background:t.pri+"12",borderRadius:"0.5rem",marginBottom:"1rem",fontSize:"0.82rem",color:t.muted,border:`1px solid ${t.pri}30`}}>
       Analizando: <strong style={{color:t.text}}>{addr.name}</strong> · Presupuesto: <strong style={{color:t.pri}}>{fCLP(budget)}/mes</strong>
     </div>}
