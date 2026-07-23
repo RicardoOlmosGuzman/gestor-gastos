@@ -84,7 +84,7 @@ const saveAK=k=>{try{localStorage.setItem(AK_KEY,k);}catch{}};
 ══════════════════════════════════════════════════════════ */
 const INIT={
   addresses:[],selAddr:null,selYear:CY,selMonth:CM,
-  profile:{name:"",incomes:[],availability:{hoursPerWeek:0,canWork:true,studying:false,entrepreneur:false,notes:""},goals:[]},
+  profile:{name:"",incomes:[],availability:{hoursPerWeek:0,canWork:true,studying:false,entrepreneur:false,notes:""},goals:[],paymentMethods:[]},
   settings:{dark:false,alertPct:25,linkProf:false,tutDone:false,iaGuideDismissed:false},
   aiHistory:[]
 };
@@ -136,6 +136,7 @@ function red(s,a){
       return{...ad,months:months.map(m=>m.id===mid?{...m,payments:[...(m.payments||[]),{id:uid(),...a.d}]}:m)};
     })};
     case"DEL_PAY":return{...s,addresses:upA(s.addresses,a.aid,ad=>mapM(ad,s.selYear,s.selMonth,m=>({...m,payments:(m.payments||[]).filter(p=>p.id!==a.pid)})))};
+    case"UPD_PAY":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,months:(ad.months||[]).map(m=>({...m,payments:(m.payments||[]).map(p=>p.id===a.pid?{...p,...a.d}:p)}))}))};
     // Gastos frecuentes conocidos (autocompletado inteligente)
     case"AKE":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,knownExtras:[...(ad.knownExtras||[]),{useCount:1,lastAmount:0,lastDate:"",...a.d}]}))};
     case"BKE":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,knownExtras:(ad.knownExtras||[]).map(k=>k.id===a.id?{...k,useCount:(k.useCount||0)+1,lastAmount:a.amount,lastDate:a.date}:k)}))};
@@ -148,6 +149,9 @@ function red(s,a){
     case"AG":return{...s,profile:{...s.profile,goals:[...s.profile.goals,{id:uid(),...a.d}]}};
     case"DG":return{...s,profile:{...s.profile,goals:s.profile.goals.filter(g=>g.id!==a.id)}};
     case"SAV":return{...s,profile:{...s.profile,availability:{...s.profile.availability,...a.d}}};
+    case"APM":return{...s,profile:{...s.profile,paymentMethods:[...(s.profile.paymentMethods||[]),{id:uid(),name:a.name,isDefault:(s.profile.paymentMethods||[]).length===0}]}};
+    case"DPM":return{...s,profile:{...s.profile,paymentMethods:(s.profile.paymentMethods||[]).filter(m=>m.id!==a.id)}};
+    case"SETDEFPM":return{...s,profile:{...s.profile,paymentMethods:(s.profile.paymentMethods||[]).map(m=>({...m,isDefault:m.id===a.id}))}};
     // Tutorial
     case"TUT_DONE":return{...s,settings:{...s.settings,tutDone:true}};
     case"TUT_SHOW":return{...s,settings:{...s.settings,tutDone:false}};
@@ -298,11 +302,29 @@ function InlineCatPicker({cats,onPick,t}){
     </div>}
   </div>;
 }
-function PayModal({state,t,onClose,onSave,addr,d}){
+/* Selector de forma de pago: prioriza las cuentas/métodos frecuentes que el
+   usuario definió en su Perfil (con la principal pre-seleccionada), y deja
+   los genéricos (Efectivo, etc.) siempre disponibles debajo */
+function methodOptionsFor(profile){
+  const custom=[...(profile?.paymentMethods||[])].sort((a,b)=>(b.isDefault?1:0)-(a.isDefault?1:0));
+  return{custom,all:[...new Set([...custom.map(m=>m.name),...PAY_METHODS])]};
+}
+function MethodChips({value,onChange,profile,t}){
+  const{custom,all}=methodOptionsFor(profile);
+  return <div>
+    {custom.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:"0.4rem",marginBottom:"0.5rem"}}>
+      {custom.map(m=><button key={m.id} onClick={()=>onChange(m.name)} style={{display:"flex",alignItems:"center",gap:"0.3rem",padding:"0.35rem 0.7rem",background:value===m.name?t.pri:t.card2,color:value===m.name?"#fff":t.text,border:`1px solid ${value===m.name?t.pri:t.border}`,borderRadius:"9999px",cursor:"pointer",fontSize:"0.79rem",fontWeight:value===m.name?700:500}}>
+        {m.isDefault&&<Star size={11} fill={value===m.name?"#fff":t.warn} color={value===m.name?"#fff":t.warn}/>}{m.name}
+      </button>)}
+    </div>}
+    <Sel val={value} onChange={onChange} opts={all} t={t}/>
+  </div>;
+}
+function PayModal({state,t,onClose,onSave,addr,d,profile}){
   const[name,setName]=useState(state.itemName||"");
   const[amount,setAmount]=useState(state.remaining!==undefined?state.remaining:(state.estimated||0));
   const[date,setDate]=useState(state.date||todayStr());
-  const[note,setNote]=useState("");const[method,setMethod]=useState("Transferencia");
+  const[note,setNote]=useState("");const[method,setMethod]=useState(()=>profile?.paymentMethods?.find(m=>m.isDefault)?.name||"Transferencia");
   const[matched,setMatched]=useState(null);
   const[pickedNewCat,setPickedNewCat]=useState(null);
   const isExtra=state.isExtra!==false;
@@ -358,9 +380,27 @@ function PayModal({state,t,onClose,onSave,addr,d}){
       {isExtra&&effectiveMatch&&effectiveMatch.lastAmount>0&&amount!==effectiveMatch.lastAmount&&<button onClick={()=>setAmount(effectiveMatch.lastAmount)} style={{background:"none",border:"none",cursor:"pointer",color:t.pri,fontSize:"0.74rem",marginTop:"0.3rem",display:"flex",alignItems:"center",gap:"0.25rem"}}><Sparkles size={11}/> Usar último monto: {fCLP(effectiveMatch.lastAmount)}</button>}
     </div>} t={t}/>
     <Fld label="Fecha" ch={<TI val={date} onChange={setDate} type="date" t={t}/>} t={t}/>
-    <Fld label="Forma de pago" ch={<Sel val={method} onChange={setMethod} opts={PAY_METHODS} t={t}/>} t={t}/>
+    <Fld label="Forma de pago" ch={<MethodChips value={method} onChange={setMethod} profile={profile} t={t}/>} t={t}/>
     <Fld label="Nota (opcional)" ch={<TI val={note} onChange={setNote} ph="Info extra..." t={t}/>} t={t}/>
     <Btn onClick={handleSave} dis={!name||!amount} full icon={<Check size={14}/>}>{isExtra?"Registrar pago ⚡":"Confirmar pago ✓"}</Btn>
+  </>}/>;
+}
+
+/* Editar un pago ya registrado — monto, fecha, forma de pago y nota,
+   sin tener que borrarlo y crearlo de nuevo */
+function EditPayModal({pay,t,onClose,onSave,profile}){
+  const[name,setName]=useState(pay.name||"");
+  const[amount,setAmount]=useState(pay.amount||0);
+  const[date,setDate]=useState(pay.date||todayStr());
+  const[method,setMethod]=useState(pay.method||"Transferencia");
+  const[note,setNote]=useState(pay.note||"");
+  return <Modal title="✏️ Editar Pago" onClose={onClose} t={t} ch={<>
+    <Fld label="Nombre" ch={<TI val={name} onChange={setName} t={t}/>} t={t}/>
+    <Fld label="Monto" ch={<MoneyInput val={amount} onChange={setAmount} t={t} af/>} t={t}/>
+    <Fld label="Fecha" ch={<TI val={date} onChange={setDate} type="date" t={t}/>} t={t}/>
+    <Fld label="Forma de pago" ch={<MethodChips value={method} onChange={setMethod} profile={profile} t={t}/>} t={t}/>
+    <Fld label="Nota (opcional)" ch={<TI val={note} onChange={setNote} ph="Info extra..." t={t}/>} t={t}/>
+    <Btn onClick={()=>{if(name&&amount)onSave({name,amount,date,method,note});}} dis={!name||!amount} full icon={<Check size={14}/>}>Guardar cambios</Btn>
   </>}/>;
 }
 
@@ -441,6 +481,7 @@ function Navbar({view,setView,s,d,t}){
 function HoyView({s,d,t,setView}){
   const[payModal,setPayModal]=useState(null);
   const[cfm,setCfm]=useState(null);
+  const[editPay,setEditPay]=useState(null);
   const addr=s.addresses.find(a=>a.id===s.selAddr);
   const budget=addr?tmplTotal(addr):0;
   const paid=addr?totalPaid(addr,s.selYear,s.selMonth):0;
@@ -585,10 +626,12 @@ function HoyView({s,d,t,setView}){
             {it.pays.map(p=><div key={p.id} style={{display:"flex",alignItems:"center",gap:"0.4rem",fontSize:"0.72rem",color:t.dim}}>
               <span style={{flex:1}}>{fmtDate(p.date)}{p.method?` · ${p.method}`:""}</span>
               <span style={{color:t.muted,fontWeight:600}}>{fCLP(p.amount)}</span>
+              <button onClick={()=>setEditPay(p)} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.1rem",display:"flex"}}><Edit2 size={10}/></button>
               <button onClick={()=>setCfm({msg:`¿Eliminar este abono de "${it.name}"?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.1rem",display:"flex"}}><Trash2 size={10}/></button>
             </div>)}
           </div>}
-          {it.pays.length===1&&<div style={{textAlign:"right",marginTop:"0.15rem"}}>
+          {it.pays.length===1&&<div style={{textAlign:"right",marginTop:"0.15rem",display:"flex",justifyContent:"flex-end",gap:"0.6rem"}}>
+            <button onClick={()=>setEditPay(it.pays[0])} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.15rem",display:"inline-flex",alignItems:"center",gap:"0.2rem",fontSize:"0.7rem"}}><Edit2 size={11}/> Editar</button>
             <button onClick={()=>setCfm({msg:`¿Desmarcar "${it.name}" como pagado?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:it.pays[0].id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.15rem",display:"inline-flex",alignItems:"center",gap:"0.2rem",fontSize:"0.7rem"}}><RotateCcw size={11}/> Desmarcar</button>
           </div>}
         </div>)}
@@ -599,6 +642,7 @@ function HoyView({s,d,t,setView}){
             <div style={{color:t.dim,fontSize:"0.7rem"}}>{p.catName?`${p.catName} · `:""}{fmtDate(p.date)}</div>
           </div>
           <span style={{color:t.warn,fontSize:"0.83rem",fontWeight:700}}>{fCLP(p.amount)}</span>
+          <button onClick={()=>setEditPay(p)} style={{background:"none",border:"none",cursor:"pointer",color:t.muted,padding:"0.2rem",display:"flex"}}><Edit2 size={12}/></button>
           <button onClick={()=>setCfm({msg:`¿Eliminar "${p.name}"?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.err,padding:"0.2rem",display:"flex"}}><Trash2 size={12}/></button>
         </div>)}
       </>} t={t} sx={{marginBottom:"1rem"}}/>}
@@ -609,7 +653,8 @@ function HoyView({s,d,t,setView}){
       </div>
     </>}
 
-    {payModal&&<PayModal state={payModal} t={t} addr={addr} d={d} onClose={()=>setPayModal(null)} onSave={dt=>{d({t:"ADD_PAY",aid:addr.id,d:dt});setPayModal(null);}}/>}
+    {payModal&&<PayModal state={payModal} t={t} addr={addr} d={d} profile={s.profile} onClose={()=>setPayModal(null)} onSave={dt=>{d({t:"ADD_PAY",aid:addr.id,d:dt});setPayModal(null);}}/>}
+    {editPay&&<EditPayModal pay={editPay} t={t} profile={s.profile} onClose={()=>setEditPay(null)} onSave={dt=>{d({t:"UPD_PAY",aid:addr.id,pid:editPay.id,d:dt});setEditPay(null);}}/>}
     {cfm&&<Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>}
   </div>;
 }
@@ -786,7 +831,7 @@ function TmplItemF({init,onSave,t}){
 
 /* ══ HISTORIAL — CALENDARIO MENSUAL ═════════════════════ */
 function HistorialView({s,d,t}){
-  const[selDay,setSelDay]=useState(null);const[payModal,setPayModal]=useState(null);const[cfm,setCfm]=useState(null);
+  const[selDay,setSelDay]=useState(null);const[payModal,setPayModal]=useState(null);const[cfm,setCfm]=useState(null);const[editPay,setEditPay]=useState(null);
   const addr=s.addresses.find(a=>a.id===s.selAddr);
   const pays=addr?mPays(addr,s.selYear,s.selMonth):[];
   const pending=addr?pendingTmpl(addr,s.selYear,s.selMonth):[];
@@ -848,6 +893,7 @@ function HistorialView({s,d,t}){
             <span style={{fontSize:"0.85rem"}}>{p.isExtra?"⚡":"✓"}</span>
             <div style={{flex:1,minWidth:0}}><div style={{color:t.text,fontSize:"0.79rem",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</div>{p.method&&<div style={{color:t.dim,fontSize:"0.67rem"}}>{p.method}</div>}</div>
             <span style={{color:p.isExtra?t.warn:t.ok,fontSize:"0.79rem",fontWeight:700,whiteSpace:"nowrap"}}>{fCLP(p.amount)}</span>
+            <button onClick={()=>setEditPay(p)} style={{background:"none",border:"none",cursor:"pointer",color:t.muted,padding:"0.15rem",display:"flex"}}><Edit2 size={11}/></button>
             <button onClick={()=>setCfm({msg:`¿Eliminar "${p.name}"?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.err,padding:"0.15rem",display:"flex"}}><Trash2 size={11}/></button>
           </div>)}
         </div>}
@@ -879,11 +925,12 @@ function HistorialView({s,d,t}){
                   <div style={{color:t.dim,fontSize:"0.67rem"}}>{fmtDate(it.pays[it.pays.length-1]?.date)}</div>
                 </div>
                 <span style={{color:it.isPaid?t.ok:t.warn,fontSize:"0.79rem",fontWeight:700,whiteSpace:"nowrap"}}>{fCLP(it.accumulated)}{!it.isPaid?`/${fCLP(it.monthlyAmt)}`:""}</span>
-                {it.pays.length===1&&<button onClick={()=>setCfm({msg:`¿Desmarcar "${it.name}"?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:it.pays[0].id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.15rem",display:"flex"}}><RotateCcw size={11}/></button>}
+                {it.pays.length===1&&<><button onClick={()=>setEditPay(it.pays[0])} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.15rem",display:"flex"}}><Edit2 size={11}/></button><button onClick={()=>setCfm({msg:`¿Desmarcar "${it.name}"?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:it.pays[0].id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.15rem",display:"flex"}}><RotateCcw size={11}/></button></>}
               </div>
               {it.pays.length>1&&<div style={{marginLeft:"1.6rem",marginTop:"0.25rem",display:"flex",flexDirection:"column",gap:"0.15rem"}}>
                 {it.pays.map(p=><div key={p.id} style={{display:"flex",gap:"0.35rem",fontSize:"0.68rem",color:t.dim,alignItems:"center"}}>
                   <span style={{flex:1}}>{fmtDate(p.date)}</span><span>{fCLP(p.amount)}</span>
+                  <button onClick={()=>setEditPay(p)} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.1rem",display:"flex"}}><Edit2 size={9}/></button>
                   <button onClick={()=>setCfm({msg:`¿Eliminar este abono?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.1rem",display:"flex"}}><Trash2 size={9}/></button>
                 </div>)}
               </div>}
@@ -892,6 +939,7 @@ function HistorialView({s,d,t}){
               <Zap size={12} color={t.warn}/>
               <div style={{flex:1,minWidth:0}}><div style={{color:t.text,fontSize:"0.8rem",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</div><div style={{color:t.dim,fontSize:"0.67rem"}}>{p.catName?`${p.catName} · `:""}{fmtDate(p.date)}</div></div>
               <span style={{color:t.warn,fontSize:"0.79rem",fontWeight:700,whiteSpace:"nowrap"}}>{fCLP(p.amount)}</span>
+              <button onClick={()=>setEditPay(p)} style={{background:"none",border:"none",cursor:"pointer",color:t.muted,padding:"0.15rem",display:"flex"}}><Edit2 size={11}/></button>
               <button onClick={()=>setCfm({msg:`¿Eliminar "${p.name}"?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.err,padding:"0.15rem",display:"flex"}}><Trash2 size={11}/></button>
             </div>)}
           </div>
@@ -899,17 +947,23 @@ function HistorialView({s,d,t}){
         {pending.length===0&&paidItems.length===0&&extras.length===0&&<CCard ch={<Empty icon={<Calendar size={30}/>} title="Sin actividad este mes" sub='Marca gastos como pagados o agrega un pago extra.' t={t}/>} t={t}/>}
       </div>
     </div>
-    {payModal&&<PayModal state={payModal} t={t} addr={addr} d={d} onClose={()=>setPayModal(null)} onSave={dt=>{d({t:"ADD_PAY",aid:addr.id,d:dt});setPayModal(null);}}/>}
+    {payModal&&<PayModal state={payModal} t={t} addr={addr} d={d} profile={s.profile} onClose={()=>setPayModal(null)} onSave={dt=>{d({t:"ADD_PAY",aid:addr.id,d:dt});setPayModal(null);}}/>}
+    {editPay&&<EditPayModal pay={editPay} t={t} profile={s.profile} onClose={()=>setEditPay(null)} onSave={dt=>{d({t:"UPD_PAY",aid:addr.id,pid:editPay.id,d:dt});setEditPay(null);}}/>}
     {cfm&&<Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>}
   </div>;
 }
 
 /* ══ ANÁLISIS ════════════════════════════════════════════ */
-function AnalisisView({s,t}){
+function AnalisisView({s,d,t}){
   const addr=s.addresses.find(a=>a.id===s.selAddr);
   const budget=addr?tmplTotal(addr):0;
   const recentMonths=useMemo(()=>{if(!addr)return[];const months=[];for(let i=11;i>=0;i--){let m=CM-i,y=CY;if(m<0){m+=12;y--;}months.push({year:y,month:m});}return months;},[addr]);
-  const[sel,setSel]=useState(()=>new Set(recentMonths.map(m=>`${m.year}-${m.month}`)));
+  const[sel,setSel]=useState(()=>{
+    const saved=s.settings.analisisSel;
+    if(saved&&saved.length)return new Set(saved);
+    return new Set(recentMonths.map(m=>`${m.year}-${m.month}`));
+  });
+  useEffect(()=>{d({t:"SS",k:"analisisSel",v:[...sel]});},[sel]);
   const[yearFilter,setYearFilter]=useState(null);
   const toggle=k=>setSel(p=>{const n=new Set(p);n.has(k)?n.delete(k):n.add(k);return n;});
   const selM=recentMonths.filter(m=>sel.has(`${m.year}-${m.month}`));
@@ -987,7 +1041,7 @@ function AnalisisView({s,t}){
         <StCard label="Promedio mensual" val={fCLP(Math.round(totalPaidAll/selM.length))} color={t.warn} t={t}/>
       </div>
       <CCard ch={<><h4 style={{margin:"0 0 0.85rem",color:t.text,fontSize:"0.9rem",fontWeight:700}}>Presupuesto vs Pagado por mes</h4>
-        <ResponsiveContainer width="100%" height={210}><BarChart data={barData} margin={{top:5,right:5,left:0,bottom:5}}><CartesianGrid strokeDasharray="3 3" stroke={t.border}/><XAxis dataKey="name" stroke={t.muted} tick={{fontSize:10,fill:t.muted}}/><YAxis stroke={t.muted} tick={{fontSize:10,fill:t.muted}} tickFormatter={v=>v>=1e6?`${(v/1e6).toFixed(1)}M`:v>=1e3?`${(v/1e3).toFixed(0)}K`:v}/><Tooltip formatter={v=>fCLP(v)} contentStyle={{background:t.card,border:`1px solid ${t.border}`,borderRadius:"0.5rem",color:t.text,fontSize:"0.79rem"}}/><Legend wrapperStyle={{fontSize:"0.75rem"}}/><Bar dataKey="Presupuesto" fill={t.pri+"66"} radius={[3,3,0,0]}/><Bar dataKey="Pagado" fill={t.ok} radius={[3,3,0,0]}/></BarChart></ResponsiveContainer>
+        <ResponsiveContainer width="100%" height={210}><BarChart data={barData} margin={{top:5,right:5,left:0,bottom:5}}><CartesianGrid strokeDasharray="3 3" stroke={t.border}/><XAxis dataKey="name" stroke={t.muted} tick={{fontSize:10,fill:t.muted}}/><YAxis stroke={t.muted} tick={{fontSize:10,fill:t.muted}} tickFormatter={v=>v>=1e6?`${(v/1e6).toFixed(1)}M`:v>=1e3?`${(v/1e3).toFixed(0)}K`:v}/><Tooltip cursor={{fill:t.pri,fillOpacity:0.08}} formatter={v=>fCLP(v)} contentStyle={{background:t.card,border:`1px solid ${t.border}`,borderRadius:"0.5rem",color:t.text,fontSize:"0.79rem"}}/><Legend wrapperStyle={{fontSize:"0.75rem"}}/><Bar dataKey="Presupuesto" fill={t.pri+"66"} radius={[3,3,0,0]}/><Bar dataKey="Pagado" fill={t.ok} radius={[3,3,0,0]}/></BarChart></ResponsiveContainer>
       </>} t={t} sx={{marginBottom:"1rem"}}/>
       {pieData.length>0&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"1rem",marginBottom:"1rem"}}>
         <CCard ch={<><h4 style={{margin:"0 0 0.85rem",color:t.text,fontSize:"0.9rem",fontWeight:700}}>Por categoría</h4>
@@ -1009,7 +1063,7 @@ function AnalisisView({s,t}){
 
 /* ══ PERFIL ══════════════════════════════════════════════ */
 function PerfilView({s,d,t}){
-  const[iM,setIM]=useState(null);const[gM,setGM]=useState(false);const[cfm,setCfm]=useState(null);
+  const[iM,setIM]=useState(null);const[gM,setGM]=useState(false);const[cfm,setCfm]=useState(null);const[pmM,setPmM]=useState(false);
   const[apiKey,setApiKey]=useState(getAK);const[showAK,setShowAK]=useState(false);
   const mInc=sumInc(s.profile);
 
@@ -1059,6 +1113,23 @@ function PerfilView({s,d,t}){
         <span style={{color:t.muted,fontSize:"0.84rem"}}>Total mensual estimado</span>
         <span style={{color:t.ok,fontWeight:800,fontSize:"0.95rem"}}>{fCLP(mInc)}</span>
       </div>}
+    </>} t={t} sx={{marginBottom:"1rem"}}/>
+    {/* Formas de pago frecuentes */}
+    <CCard ch={<>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"0.75rem"}}>
+        <h4 style={{margin:0,color:t.text,fontSize:"0.9rem",fontWeight:700}}>💳 Formas de pago frecuentes</h4>
+        <Btn onClick={()=>setPmM(true)} icon={<Plus size={13}/>} sz="sm">Agregar</Btn>
+      </div>
+      {(!s.profile.paymentMethods||s.profile.paymentMethods.length===0)&&<p style={{color:t.muted,fontSize:"0.84rem",textAlign:"center",padding:"0.75rem 0"}}>Agrega tus cuentas o tarjetas habituales (ej. "Débito BancoEstado", "Mach") para elegirlas con un tap al registrar un pago.</p>}
+      {(s.profile.paymentMethods||[]).map(m=><div key={m.id} style={{display:"flex",alignItems:"center",gap:"0.65rem",padding:"0.55rem 0.75rem",background:t.card2,borderRadius:"0.5rem",marginBottom:"0.4rem"}}>
+        <Star size={14} color={m.isDefault?t.warn:t.dim} fill={m.isDefault?t.warn:"none"}/>
+        <div style={{flex:1}}>
+          <div style={{color:t.text,fontSize:"0.84rem",fontWeight:600}}>{m.name}</div>
+          {m.isDefault&&<div style={{color:t.dim,fontSize:"0.7rem"}}>Principal — aparece preseleccionada</div>}
+        </div>
+        {!m.isDefault&&<Btn onClick={()=>d({t:"SETDEFPM",id:m.id})} v="ghost" sz="sm">Usar como principal</Btn>}
+        <button onClick={()=>setCfm({msg:`¿Eliminar "${m.name}"?`,ok:()=>{d({t:"DPM",id:m.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.err,padding:"0.2rem",display:"flex"}}><Trash2 size={13}/></button>
+      </div>)}
     </>} t={t} sx={{marginBottom:"1rem"}}/>
     {/* Disponibilidad */}
     <CCard ch={<>
@@ -1116,6 +1187,7 @@ function PerfilView({s,d,t}){
     </>} t={t}/>
     {iM&&<Modal title={iM==="add"?"Nuevo Ingreso":"Editar Ingreso"} onClose={()=>setIM(null)} t={t} ch={<IncF init={iM==="add"?{}:{type:iM.e.type,name:iM.e.name,amount:iM.e.amount,frequency:iM.e.frequency}} onSave={dt=>{iM==="add"?d({t:"AINC",d:dt}):d({t:"UINC",id:iM.e.id,d:dt});setIM(null);}} t={t}/>}/>}
     {gM&&<Modal title="Nuevo Objetivo" onClose={()=>setGM(false)} t={t} ch={<GoalF onSave={dt=>{d({t:"AG",d:dt});setGM(false);}} t={t}/>}/>}
+    {pmM&&<Modal title="Nueva Forma de Pago" onClose={()=>setPmM(false)} t={t} ch={<PayMethodF onSave={name=>{d({t:"APM",name});setPmM(false);}} t={t}/>}/>}
     {cfm&&<Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>}
   </div>;
 }
@@ -1140,6 +1212,14 @@ function GoalF({onSave,t}){
     <Fld label="Fecha límite (opcional)" ch={<TI val={dl} onChange={setDl} type="month" t={t}/>} t={t}/>
     <Fld label="Prioridad" ch={<div style={{display:"flex",gap:"0.5rem"}}>{["alta","media","baja"].map(p=><button key={p} onClick={()=>setPri(p)} style={{flex:1,padding:"0.4rem",border:`2px solid ${pri===p?ps[p]:t.border}`,borderRadius:"0.5rem",background:pri===p?`${ps[p]}18`:"none",color:ps[p],cursor:"pointer",fontSize:"0.79rem",fontWeight:700,textTransform:"capitalize"}}>{p}</button>)}</div>} t={t}/>
     <Btn onClick={()=>name&&onSave({name,targetAmount:target,deadline:dl,priority:pri})} dis={!name} full icon={<Check size={14}/>}>Crear objetivo</Btn>
+  </>;
+}
+function PayMethodF({onSave,t}){
+  const[name,setName]=useState("");
+  return <>
+    <Fld label="Nombre de la cuenta o tarjeta" ch={<TI val={name} onChange={setName} ph="Débito BancoEstado, Mach, Efectivo..." t={t}/>} t={t}/>
+    <p style={{color:t.dim,fontSize:"0.76rem",margin:"0 0 0.85rem",lineHeight:1.5}}>La primera que agregues queda marcada como principal. Puedes cambiarla después con "Usar como principal".</p>
+    <Btn onClick={()=>name.trim()&&onSave(name.trim())} dis={!name.trim()} full icon={<Check size={14}/>}>Agregar</Btn>
   </>;
 }
 
@@ -1438,7 +1518,7 @@ export default function App(){
     <div style={{textAlign:"center"}}><RefreshCw size={28} color="#7C3AED" style={{animation:"spin 1s linear infinite",marginBottom:"0.75rem"}}/><p style={{color:"#7D8590",fontSize:"0.9rem"}}>Cargando...</p></div>
     <style>{"@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}"}</style>
   </div>;
-  const VIEWS={hoy:<HoyView s={s} d={d} t={t} setView={setView}/>,plantilla:<PlantillaView s={s} d={d} t={t}/>,historial:<HistorialView s={s} d={d} t={t}/>,analisis:<AnalisisView s={s} t={t}/>,perfil:<PerfilView s={s} d={d} t={t}/>,ia:<IAView s={s} d={d} t={t}/>};
+  const VIEWS={hoy:<HoyView s={s} d={d} t={t} setView={setView}/>,plantilla:<PlantillaView s={s} d={d} t={t}/>,historial:<HistorialView s={s} d={d} t={t}/>,analisis:<AnalisisView s={s} d={d} t={t}/>,perfil:<PerfilView s={s} d={d} t={t}/>,ia:<IAView s={s} d={d} t={t}/>};
   return <div style={{minHeight:"100vh",background:t.bg,color:t.text,transition:"background .2s,color .2s",fontFamily:"system-ui,-apple-system,sans-serif"}}>
     <Navbar view={view} setView={setView} s={s} d={d} t={t}/>
     <div style={{maxWidth:"920px",margin:"0 auto",padding:"1.5rem 1rem 4rem"}}>{VIEWS[view]||VIEWS.hoy}</div>
