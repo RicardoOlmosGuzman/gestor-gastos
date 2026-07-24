@@ -1,7 +1,7 @@
 import { useState, useEffect, useReducer, useMemo, useRef } from "react";
 import { BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import * as XLSX from "xlsx";
-import { Plus, Trash2, Edit2, ChevronDown, ChevronUp, Home, BarChart2, User, Brain, Sun, Moon, Download, FileText, AlertTriangle, DollarSign, TrendingUp, TrendingDown, Check, Building2, Target, Sparkles, Wallet, RefreshCw, Info, Calendar, Clock, HelpCircle, ChevronLeft, ChevronRight, CheckCircle2, Zap, Upload, RotateCcw, ArrowRight, List, BookOpen, Star } from "lucide-react";
+import { Plus, Trash2, Edit2, ChevronDown, ChevronUp, Home, BarChart2, User, Brain, Sun, Moon, Download, FileText, AlertTriangle, DollarSign, TrendingUp, TrendingDown, Check, Building2, Target, Sparkles, Wallet, RefreshCw, Info, Calendar, Clock, HelpCircle, ChevronLeft, ChevronRight, CheckCircle2, Zap, Upload, RotateCcw, ArrowRight, List, BookOpen, Star, Bell } from "lucide-react";
 
 /* ══ CONSTANTES ══════════════════════════════════════════ */
 const MESES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
@@ -41,6 +41,36 @@ const pendingTmpl=(addr,y,m)=>allTmplItems(addr).map(it=>({...it,accumulated:ite
 const paidTmpl=(addr,y,m)=>allTmplItems(addr).map(it=>{const acc=itemAccumulated(addr,y,m,it.id);const pays=mPays(addr,y,m).filter(p=>p.templateItemId===it.id);return acc>0?{...it,accumulated:acc,pays,isPaid:acc>=it.monthlyAmt}:null;}).filter(Boolean);
 // Pagos extra (no de plantilla)
 const extraPays=(addr,y,m)=>mPays(addr,y,m).filter(p=>p.isExtra);
+
+// ═══ ABONOS (ingresos) — espejo exacto del sistema de pagos ═══
+const mAbonos=(addr,y,m)=>(addr?.months||[]).find(x=>x.year===y&&x.month===m)?.abonos||[];
+const totalAbonos=(addr,y,m)=>mAbonos(addr,y,m).reduce((s,a)=>s+(a.amount||0),0);
+const extraAbonos=(addr,y,m)=>mAbonos(addr,y,m).filter(a=>a.isExtra);
+// Ingresos recurrentes (de profile.incomes) aún no abonados este mes
+const pendingIncomes=(profile,addr,y,m)=>{
+  const abonos=mAbonos(addr,y,m);
+  return (profile?.incomes||[]).map(inc=>({...inc,monthlyAmt:toM(inc),accumulated:abonos.filter(a=>a.templateIncomeId===inc.id).reduce((s,a)=>s+(a.amount||0),0)})).filter(inc=>inc.accumulated<inc.monthlyAmt);
+};
+// Ingresos recurrentes ya abonados (parcial o completo) este mes
+const paidIncomes=(profile,addr,y,m)=>{
+  const abonos=mAbonos(addr,y,m);
+  return (profile?.incomes||[]).map(inc=>{
+    const pays=abonos.filter(a=>a.templateIncomeId===inc.id);
+    if(!pays.length)return null;
+    const monthlyAmt=toM(inc),accumulated=pays.reduce((s,a)=>s+(a.amount||0),0);
+    return{...inc,monthlyAmt,pays,accumulated,isPaid:accumulated>=monthlyAmt};
+  }).filter(Boolean);
+};
+// Saldo de cuenta calculado desde la fecha en que se declaró (fechas ISO, comparables como texto)
+const balanceAsOf=addr=>{
+  if(!addr?.startingBalanceDate)return null;
+  let bal=addr.startingBalance||0;
+  (addr.months||[]).forEach(m=>{
+    (m.abonos||[]).forEach(a=>{if(a.date>=addr.startingBalanceDate)bal+=a.amount||0;});
+    (m.payments||[]).forEach(p=>{if(p.date>=addr.startingBalanceDate)bal-=p.amount||0;});
+  });
+  return bal;
+};
 
 // Sugerencias: extras que se repiten 2+ veces y no están en la plantilla
 const smartSuggestions=addr=>{
@@ -92,7 +122,7 @@ const upA=(addrs,id,fn)=>addrs.map(a=>a.id===id?fn(a):a);
 const gOrM=(addr,y,m)=>{
   const ex=(addr.months||[]).find(x=>x.year===y&&x.month===m);
   if(ex)return{months:addr.months,mid:ex.id};
-  const nm={id:uid(),year:y,month:m,payments:[]};
+  const nm={id:uid(),year:y,month:m,payments:[],abonos:[]};
   return{months:[...(addr.months||[]),nm],mid:nm.id};
 };
 const mapM=(addr,y,m,fn)=>({...addr,months:(addr.months||[]).map(x=>x.year===y&&x.month===m?fn(x):x)});
@@ -105,7 +135,7 @@ function red(s,a){
     case"YM":return{...s,...(a.year!==undefined&&{selYear:a.year}),...(a.month!==undefined&&{selMonth:a.month})};
     case"SA":return{...s,selAddr:a.id};
     // Direcciones
-    case"AA":{const n={id:uid(),name:a.name,address:a.addr||"",template:{categories:[]},months:[],knownExtras:[]};return{...s,addresses:[...s.addresses,n],selAddr:n.id};}
+    case"AA":{const n={id:uid(),name:a.name,address:a.addr||"",template:{categories:[]},months:[],knownExtras:[],startingBalance:0,startingBalanceDate:null,dismissedNotifs:[]};return{...s,addresses:[...s.addresses,n],selAddr:n.id};}
     case"UA":return{...s,addresses:upA(s.addresses,a.id,x=>({...x,name:a.name,address:a.addr||""}))};
     case"DA":return{...s,addresses:s.addresses.filter(x=>x.id!==a.id),selAddr:s.selAddr===a.id?null:s.selAddr};
     // Plantilla — categorías
@@ -127,8 +157,8 @@ function red(s,a){
       return{...ad,template:{...ad.template,categories:newCats},knownExtras:newKE,months:newMonths};
     })};
     // Plantilla — ítems
-    case"ATI":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,items:[...(c.items||[]),{id:uid(),name:a.name,amount:a.amount||0,isVariable:a.isVariable||false,frequency:a.frequency||"mensual"}]}:c)}}))};
-    case"UTI":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,items:(c.items||[]).map(it=>it.id===a.iid?{...it,name:a.name,amount:a.amount||0,isVariable:a.isVariable||false,frequency:a.frequency||"mensual"}:it)}:c)}}))};
+    case"ATI":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,items:[...(c.items||[]),{id:uid(),name:a.name,amount:a.amount||0,isVariable:a.isVariable||false,frequency:a.frequency||"mensual",dueDay:a.dueDay||null,autoDetect:a.autoDetect||false}]}:c)}}))};
+    case"UTI":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,items:(c.items||[]).map(it=>it.id===a.iid?{...it,name:a.name,amount:a.amount||0,isVariable:a.isVariable||false,frequency:a.frequency||"mensual",dueDay:a.dueDay||null,autoDetect:a.autoDetect||false}:it)}:c)}}))};
     case"DTI":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,template:{...ad.template,categories:(ad.template?.categories||[]).map(c=>c.id===a.cid?{...c,items:(c.items||[]).filter(it=>it.id!==a.iid)}:c)}}))};
     // Pagos del mes
     case"ADD_PAY":return{...s,addresses:upA(s.addresses,a.aid,ad=>{
@@ -137,6 +167,19 @@ function red(s,a){
     })};
     case"DEL_PAY":return{...s,addresses:upA(s.addresses,a.aid,ad=>mapM(ad,s.selYear,s.selMonth,m=>({...m,payments:(m.payments||[]).filter(p=>p.id!==a.pid)})))};
     case"UPD_PAY":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,months:(ad.months||[]).map(m=>({...m,payments:(m.payments||[]).map(p=>p.id===a.pid?{...p,...a.d}:p)}))}))};
+    // Abonos (ingresos) — espejo de los pagos
+    case"ADD_ABONO":return{...s,addresses:upA(s.addresses,a.aid,ad=>{
+      const{months,mid}=gOrM(ad,s.selYear,s.selMonth);
+      return{...ad,months:months.map(m=>m.id===mid?{...m,abonos:[...(m.abonos||[]),{id:uid(),...a.d}]}:m)};
+    })};
+    case"DEL_ABONO":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,months:(ad.months||[]).map(m=>({...m,abonos:(m.abonos||[]).filter(x=>x.id!==a.pid)}))}))};
+    case"UPD_ABONO":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,months:(ad.months||[]).map(m=>({...m,abonos:(m.abonos||[]).map(x=>x.id===a.pid?{...x,...a.d}:x)}))}))};
+    // Saldo de cuenta
+    case"SET_BALANCE":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,startingBalance:a.amount,startingBalanceDate:a.date}))};
+    // Notificaciones automáticas descartadas ("no se hizo")
+    case"DISMISS_NOTIF":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,dismissedNotifs:[...(ad.dismissedNotifs||[]),a.key]}))};
+    // Reiniciar cuenta: borra gastos fijos + historial + saldo, mantiene nombre y dirección física
+    case"RESET_ADDR":return{...s,addresses:upA(s.addresses,a.aid,ad=>({id:ad.id,name:ad.name,address:ad.address,template:{categories:[]},months:[],knownExtras:[],startingBalance:0,startingBalanceDate:null,dismissedNotifs:[]}))};
     // Gastos frecuentes conocidos (autocompletado inteligente)
     case"AKE":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,knownExtras:[...(ad.knownExtras||[]),{useCount:1,lastAmount:0,lastDate:"",...a.d}]}))};
     case"BKE":return{...s,addresses:upA(s.addresses,a.aid,ad=>({...ad,knownExtras:(ad.knownExtras||[]).map(k=>k.id===a.id?{...k,useCount:(k.useCount||0)+1,lastAmount:a.amount,lastDate:a.date}:k)}))};
@@ -388,20 +431,64 @@ function PayModal({state,t,onClose,onSave,addr,d,profile}){
 
 /* Editar un pago ya registrado — monto, fecha, forma de pago y nota,
    sin tener que borrarlo y crearlo de nuevo */
-function EditPayModal({pay,t,onClose,onSave,profile}){
+function EditPayModal({pay,t,onClose,onSave,profile,isAbono}){
   const[name,setName]=useState(pay.name||"");
   const[amount,setAmount]=useState(pay.amount||0);
   const[date,setDate]=useState(pay.date||todayStr());
-  const[method,setMethod]=useState(pay.method||"Transferencia");
+  const[method,setMethod]=useState(pay.method||pay.source||"Transferencia");
   const[note,setNote]=useState(pay.note||"");
-  return <Modal title="✏️ Editar Pago" onClose={onClose} t={t} ch={<>
+  return <Modal title={isAbono?"✏️ Editar Abono":"✏️ Editar Pago"} onClose={onClose} t={t} ch={<>
     <Fld label="Nombre" ch={<TI val={name} onChange={setName} t={t}/>} t={t}/>
     <Fld label="Monto" ch={<MoneyInput val={amount} onChange={setAmount} t={t} af/>} t={t}/>
     <Fld label="Fecha" ch={<TI val={date} onChange={setDate} type="date" t={t}/>} t={t}/>
-    <Fld label="Forma de pago" ch={<MethodChips value={method} onChange={setMethod} profile={profile} t={t}/>} t={t}/>
+    {isAbono?<Fld label="Origen" ch={<Sel val={method} onChange={setMethod} opts={["Transferencia","Depósito","Efectivo","Otro"]} t={t}/>} t={t}/>
+             :<Fld label="Forma de pago" ch={<MethodChips value={method} onChange={setMethod} profile={profile} t={t}/>} t={t}/>}
     <Fld label="Nota (opcional)" ch={<TI val={note} onChange={setNote} ph="Info extra..." t={t}/>} t={t}/>
-    <Btn onClick={()=>{if(name&&amount)onSave({name,amount,date,method,note});}} dis={!name||!amount} full icon={<Check size={14}/>}>Guardar cambios</Btn>
+    <Btn onClick={()=>{if(name&&amount)onSave(isAbono?{name,amount,date,source:method,note}:{name,amount,date,method,note});}} dis={!name||!amount} full icon={<Check size={14}/>}>Guardar cambios</Btn>
   </>}/>;
+}
+
+/* Registrar un abono (ingreso): mismo espíritu que PayModal pero para plata
+   que entra — sea un ingreso recurrente ya definido en el Perfil, o uno nuevo */
+function AbonoModal({state,t,onClose,onSave}){
+  const[name,setName]=useState(state.itemName||"");
+  const[amount,setAmount]=useState(state.remaining!==undefined?state.remaining:(state.estimated||0));
+  const[date,setDate]=useState(state.date||todayStr());
+  const[source,setSource]=useState("Transferencia");
+  const[note,setNote]=useState("");
+  const isExtra=state.isExtra!==false;
+  return <Modal title={isExtra?"💰 Registrar Abono":"✓ Confirmar Ingreso"} onClose={onClose} t={t} ch={<>
+    {!isExtra&&<div style={{padding:"0.6rem 0.75rem",background:t.ok+"12",borderRadius:"0.5rem",marginBottom:"0.85rem",fontSize:"0.82rem",color:t.muted}}>
+      <div style={{display:"flex",gap:"0.5rem",alignItems:"center",marginBottom:state.accumulated>0?"0.4rem":"0"}}><CheckCircle2 size={14} color={t.ok}/><span>Ingreso: <strong style={{color:t.text}}>{state.itemName}</strong> · Esperado: <strong style={{color:t.text}}>{fCLP(state.estimated)}</strong></span></div>
+      {state.accumulated>0&&<div style={{display:"flex",gap:"0.75rem",fontSize:"0.79rem",paddingLeft:"0.25rem"}}><span>✅ Ya recibido: <strong style={{color:t.ok}}>{fCLP(state.accumulated)}</strong></span><span>⏳ Falta: <strong style={{color:t.warn}}>{fCLP(state.remaining)}</strong></span></div>}
+    </div>}
+    <Fld label="¿De dónde llegó el dinero?" ch={<TI val={name} onChange={setName} ph="Sueldo, Beca, Regalo, Reembolso..." t={t}/>} t={t}/>
+    <Fld label="Monto recibido" ch={<MoneyInput val={amount} onChange={setAmount} t={t} af/>} t={t}/>
+    <Fld label="Fecha" ch={<TI val={date} onChange={setDate} type="date" t={t}/>} t={t}/>
+    <Fld label="Origen" ch={<Sel val={source} onChange={setSource} opts={["Transferencia","Depósito","Efectivo","Otro"]} t={t}/>} t={t}/>
+    <Fld label="Nota (opcional)" ch={<TI val={note} onChange={setNote} ph="Info extra..." t={t}/>} t={t}/>
+    <Btn onClick={()=>{if(name&&amount)onSave({name,amount,date,source,note,templateIncomeId:state.itemId||null,isExtra:state.isExtra!==false});}} dis={!name||!amount} full icon={<Check size={14}/>}>{isExtra?"Registrar abono 💰":"Confirmar ingreso ✓"}</Btn>
+  </>}/>;
+}
+
+/* Tarjeta de notificación cuando la app detecta que llegó la fecha de un
+   gasto o ingreso automático. 3 salidas: confirmar (registra al tiro),
+   saltar (vuelve a preguntar la próxima vez que abras la app) o descartar
+   (no se hizo — no volver a preguntar por esta ocurrencia del mes) */
+function AutoDetectCard({item,isIncome,onConfirm,onSkip,onDismiss,t}){
+  return <div style={{display:"flex",alignItems:"flex-start",gap:"0.65rem",padding:"0.75rem 0.85rem",background:isIncome?t.ok+"12":t.pri+"12",border:`1px solid ${isIncome?t.ok:t.pri}40`,borderRadius:"0.6rem",marginBottom:"0.5rem"}}>
+    <Bell size={16} color={isIncome?t.ok:t.pri} style={{marginTop:"0.15rem",flexShrink:0}}/>
+    <div style={{flex:1,minWidth:0}}>
+      <div style={{color:t.text,fontSize:"0.83rem",lineHeight:1.5}}>
+        Ya es {NOW.getDate()} — el día {item.dueDay} {isIncome?"esperabas recibir":"se cobra"} <strong>{item.name}</strong> (~{fCLP(isIncome?toM(item):item.amount)}). ¿{isIncome?"Te llegó":"Se pagó"}?
+      </div>
+      <div style={{display:"flex",gap:"0.4rem",marginTop:"0.55rem",flexWrap:"wrap"}}>
+        <Btn onClick={onConfirm} v={isIncome?"ok":"pri"} sz="sm" icon={<Check size={12}/>}>Sí, confirmar</Btn>
+        <Btn onClick={onSkip} v="ghost" sz="sm">Saltar</Btn>
+        <Btn onClick={onDismiss} v="ghost" sz="sm" sx={{color:t.err}}>No se hizo</Btn>
+      </div>
+    </div>
+  </div>;
 }
 
 /* ══ TUTORIAL ════════════════════════════════════════════ */
@@ -410,10 +497,11 @@ function Tutorial({onDone,t}){
   const STEPS=[
     {e:"👋",title:"¡Hola! Bienvenido a GestorGastos",desc:"Esta app está hecha para ser simple en el uso diario.\n\nEl objetivo: abres la app, registras lo que pagaste, la cierras.\n\nTe mostramos cómo funciona todo. Puedes volver aquí con el botón ❓ del menú.",hint:""},
     {e:"🏠",title:"Inicio — Tu centro de operaciones",desc:"Aquí está todo lo que necesitas en el día a día:\n\n• Cuánto llevas pagado este mes vs tu presupuesto\n• Tus gastos fijos pendientes de pagar (un tap para marcarlos)\n• Botón grande para registrar cualquier gasto en segundos\n• Chips de \"pago frecuente\" — repite un gasto que ya hiciste antes con un solo tap\n• Al escribir, la app recuerda lugares que ya usaste y sugiere su categoría automáticamente. Si es nuevo, te deja crear la categoría ahí mismo",hint:"💡 Esta es la pantalla que abrirás todos los días. El flujo es: abrir → pagar → cerrar."},
-    {e:"📋",title:"Gastos Fijos — Configuras una vez",desc:"Aquí defines los gastos que tienes TODOS los meses:\n• Arriendo: $350.000 (fijo)\n• Luz: ~$40.000 (variable, cambia cada mes)\n• Agua, internet, suscripciones...\n\nLos configuras UNA VEZ y aparecen como pendientes automáticamente cada mes. Nunca más tienes que volver a ingresarlos.",hint:"💡 Si un monto varía (luz, agua), márcalo como 'variable'. El monto que pones es solo una estimación."},
-    {e:"📅",title:"Historial — El mes en detalle",desc:"El calendario mensual muestra todo:\n• Los días con pagos tienen puntos de color\n• Verde = gasto fijo pagado · Naranja = gasto extra\n• Click en un día para ver o agregar pagos\n• Navega entre meses con las flechas ‹ ›",hint:""},
+    {e:"📋",title:"Gastos Fijos — Configuras una vez",desc:"Aquí defines los gastos que tienes TODOS los meses:\n• Arriendo: $350.000 (fijo)\n• Luz: ~$40.000 (variable, cambia cada mes)\n• Agua, internet, suscripciones...\n\nLos configuras UNA VEZ y aparecen como pendientes automáticamente cada mes. Nunca más tienes que volver a ingresarlos.\n\n🛒 Caso especial: el supermercado. No se gasta de una sola vez — ve varios días distintos. Ponle un monto estimado (ej. $200.000) y cada vez que compres, usa \"+ Abonar\" con lo que gastaste ESE día. La app va sumando hasta completar tu estimado — sin que tengas que forzar que calce en una sola visita.",hint:"💡 Si un monto varía (luz, agua), márcalo como 'variable'. El monto que pones es solo una estimación."},
+    {e:"💰",title:"Abonos — el dinero que entra",desc:"Así como registras lo que gastas, también registras lo que recibes: sueldo, beca, un reembolso, cualquier ingreso.\n\n• En Inicio hay un botón \"Registrar abono\" junto al de pago\n• En Perfil puedes declarar tus ingresos recurrentes (con día en que suelen llegar)\n• Si le pones fecha y activas el aviso automático, la app te pregunta \"¿ya llegó?\" apenas pase esa fecha\n\nEsto convierte la app en un historial de flujo de dinero completo: lo que entra y lo que sale.",hint:"💡 Configura tu saldo actual en Perfil para ver cuánta plata tienes estimada en todo momento."},
+    {e:"📅",title:"Historial — El mes en detalle",desc:"El calendario mensual muestra todo, con un toggle para ver Gastos o Ingresos:\n• Verde = gasto fijo pagado · Naranja = gasto extra · Celeste = abono\n• Click en un día para ver o agregar movimientos\n• Navega entre meses con las flechas ‹ ›",hint:""},
     {e:"📊",title:"Análisis — Entiende tus gastos",desc:"Para cuando quieres ver el panorama:\n• Gráfico de presupuesto vs lo que realmente pagaste\n• Distribución por categoría\n• Evolución mes a mes\n\nExporta a Excel o imprime como PDF.",hint:"💡 Úsalo una vez al mes. El resto del tiempo, usa solo la pantalla de Inicio."},
-    {e:"👤",title:"Perfil — Tus datos e ingresos",desc:"Configura:\n• Tu nombre (aparece en el saludo)\n• Fuentes de ingreso (sueldo, beca, etc.)\n• Objetivos de ahorro\n• API key para la IA\n\n¡Importante! Aquí también puedes EXPORTAR tus datos como respaldo JSON e IMPORTARLOS si cambias de dispositivo.",hint:"💡 Exporta tus datos regularmente como respaldo. Los datos viven en tu navegador."},
+    {e:"👤",title:"Perfil — Tus datos e ingresos",desc:"Configura:\n• Tu nombre (aparece en el saludo)\n• Saldo actual de tu cuenta\n• Fuentes de ingreso (sueldo, beca, etc.)\n• Objetivos de ahorro\n• API key para la IA\n\n¡Importante! Aquí también puedes EXPORTAR tus datos como respaldo JSON e IMPORTARLOS si cambias de dispositivo, o usar \"Reiniciar cuenta\" si quieres empezar de cero sin perder tu perfil.",hint:"💡 Exporta tus datos regularmente como respaldo. Los datos viven en tu navegador."},
     {e:"🧠",title:"Plan IA — Tu asesor financiero",desc:"Usando tu presupuesto y gastos reales, la IA genera:\n💰 Plan de ahorro personalizado\n🔍 Diagnóstico categoría por categoría\n🆘 Presupuesto de supervivencia\n🚀 Ideas de ingresos extra para Chile\n📊 Análisis del método 50/30/20",hint:"🔑 Necesitas API key gratuita de Anthropic (platform.claude.com). En la pestaña Plan IA hay una guía paso a paso."},
   ];
   const cur=STEPS[step],isLast=step===STEPS.length-1;
@@ -480,8 +568,11 @@ function Navbar({view,setView,s,d,t}){
 /* ══ HOY — Pantalla principal (daily driver) ═════════════ */
 function HoyView({s,d,t,setView}){
   const[payModal,setPayModal]=useState(null);
+  const[abonoModal,setAbonoModal]=useState(null);
   const[cfm,setCfm]=useState(null);
   const[editPay,setEditPay]=useState(null);
+  const[editAbono,setEditAbono]=useState(null);
+  const[skipped,setSkipped]=useState(()=>new Set());
   const addr=s.addresses.find(a=>a.id===s.selAddr);
   const budget=addr?tmplTotal(addr):0;
   const paid=addr?totalPaid(addr,s.selYear,s.selMonth):0;
@@ -491,6 +582,13 @@ function HoyView({s,d,t,setView}){
   const extras=addr?extraPays(addr,s.selYear,s.selMonth):[];
   const catNames=[...new Set((addr?.template?.categories||[]).map(c=>c.name))];
   const suggestions=addr?smartSuggestions(addr):[];
+  const abonosRecibidos=addr?totalAbonos(addr,s.selYear,s.selMonth):0;
+  const balance=addr?balanceAsOf(addr):null;
+  const isCurrentMonth=s.selYear===CY&&s.selMonth===CM;
+  const todayDay=NOW.getDate();
+  // Notificaciones de detección automática — solo tiene sentido en el mes real actual
+  const notifExpenses=isCurrentMonth&&addr?pending.filter(it=>it.autoDetect&&it.dueDay&&todayDay>=it.dueDay&&!(addr.dismissedNotifs||[]).includes(`p-${it.id}-${s.selYear}-${s.selMonth}`)&&!skipped.has(`p-${it.id}`)):[];
+  const notifIncomes=isCurrentMonth&&addr?pendingIncomes(s.profile,addr,s.selYear,s.selMonth).filter(inc=>inc.autoDetect&&inc.dueDay&&todayDay>=inc.dueDay&&!(addr.dismissedNotifs||[]).includes(`i-${inc.id}-${s.selYear}-${s.selMonth}`)&&!skipped.has(`i-${inc.id}`)):[];
 
   return <div>
     {/* Saludo */}
@@ -510,6 +608,18 @@ function HoyView({s,d,t,setView}){
         </select>
       </div>
     </div>
+
+    {/* Notificaciones automáticas — gastos/ingresos con plazo detectado */}
+    {(notifExpenses.length>0||notifIncomes.length>0)&&<div style={{marginBottom:"1.1rem"}}>
+      {notifExpenses.map(it=><AutoDetectCard key={it.id} item={it} isIncome={false} t={t}
+        onConfirm={()=>d({t:"ADD_PAY",aid:addr.id,d:{name:it.name,amount:it.monthlyAmt,date:todayStr(),method:"Transferencia",note:"",catId:it.catId,catName:it.catName,templateItemId:it.id,isExtra:false}})}
+        onSkip={()=>setSkipped(p=>new Set(p).add(`p-${it.id}`))}
+        onDismiss={()=>d({t:"DISMISS_NOTIF",aid:addr.id,key:`p-${it.id}-${s.selYear}-${s.selMonth}`})}/>)}
+      {notifIncomes.map(inc=><AutoDetectCard key={inc.id} item={inc} isIncome={true} t={t}
+        onConfirm={()=>d({t:"ADD_ABONO",aid:addr.id,d:{name:inc.name,amount:inc.monthlyAmt,date:todayStr(),source:"Transferencia",note:"",templateIncomeId:inc.id,isExtra:false}})}
+        onSkip={()=>setSkipped(p=>new Set(p).add(`i-${inc.id}`))}
+        onDismiss={()=>d({t:"DISMISS_NOTIF",aid:addr.id,key:`i-${inc.id}-${s.selYear}-${s.selMonth}`})}/>)}
+    </div>}
 
     {/* Onboarding si no hay dirección */}
     {!addr&&<div>
@@ -551,10 +661,21 @@ function HoyView({s,d,t,setView}){
         </div>}
       </>} t={t} sx={{marginBottom:"1rem"}}/>
 
+      {/* Saldo de cuenta (si el usuario lo configuró en Perfil) */}
+      {balance!==null&&<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"0.7rem 0.9rem",background:t.card,border:`1px solid ${t.border}`,borderRadius:"0.65rem",marginBottom:"1rem",boxShadow:t.sm}}>
+        <span style={{color:t.muted,fontSize:"0.82rem"}}>💳 Saldo estimado de tu cuenta</span>
+        <span style={{color:balance>=0?t.ok:t.err,fontWeight:800,fontSize:"1.05rem"}}>{fCLP(balance)}</span>
+      </div>}
+
       {/* BOTÓN PRINCIPAL */}
-      <button onClick={()=>setPayModal({date:todayStr(),isExtra:true})} style={{width:"100%",padding:"1rem",background:`linear-gradient(135deg,${t.pri},${t.priL})`,color:"#fff",border:"none",borderRadius:"0.75rem",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:"0.6rem",fontSize:"1.05rem",fontWeight:700,boxShadow:`0 4px 16px ${t.pri}44`,marginBottom:"1rem"}}>
-        <Plus size={22}/> Registrar pago ahora
-      </button>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0.65rem",marginBottom:"1rem"}}>
+        <button onClick={()=>setPayModal({date:todayStr(),isExtra:true})} style={{padding:"1rem",background:`linear-gradient(135deg,${t.pri},${t.priL})`,color:"#fff",border:"none",borderRadius:"0.75rem",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:"0.5rem",fontSize:"0.95rem",fontWeight:700,boxShadow:`0 4px 16px ${t.pri}44`}}>
+          <Plus size={20}/> Registrar pago
+        </button>
+        <button onClick={()=>setAbonoModal({date:todayStr(),isExtra:true})} style={{padding:"1rem",background:`linear-gradient(135deg,${t.ok},#059669)`,color:"#fff",border:"none",borderRadius:"0.75rem",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:"0.5rem",fontSize:"0.95rem",fontWeight:700,boxShadow:`0 4px 16px ${t.ok}44`}}>
+          <TrendingUp size={20}/> Registrar abono
+        </button>
+      </div>
 
       {/* Repetir pago frecuente — un tap, sin escribir nada */}
       {knownExtrasSorted(addr).length>0&&<div style={{marginBottom:"1rem"}}>
@@ -655,6 +776,8 @@ function HoyView({s,d,t,setView}){
 
     {payModal&&<PayModal state={payModal} t={t} addr={addr} d={d} profile={s.profile} onClose={()=>setPayModal(null)} onSave={dt=>{d({t:"ADD_PAY",aid:addr.id,d:dt});setPayModal(null);}}/>}
     {editPay&&<EditPayModal pay={editPay} t={t} profile={s.profile} onClose={()=>setEditPay(null)} onSave={dt=>{d({t:"UPD_PAY",aid:addr.id,pid:editPay.id,d:dt});setEditPay(null);}}/>}
+    {abonoModal&&<AbonoModal state={abonoModal} t={t} onClose={()=>setAbonoModal(null)} onSave={dt=>{d({t:"ADD_ABONO",aid:addr.id,d:dt});setAbonoModal(null);}}/>}
+    {editAbono&&<EditPayModal pay={editAbono} t={t} isAbono onClose={()=>setEditAbono(null)} onSave={dt=>{d({t:"UPD_ABONO",aid:addr.id,pid:editAbono.id,d:dt});setEditAbono(null);}}/>}
     {cfm&&<Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>}
   </div>;
 }
@@ -782,7 +905,7 @@ function PlantillaView({s,d,t}){
 
     {aM&&<Modal title={aM==="add"?"Nueva Dirección":"Editar Dirección"} onClose={()=>setAM(null)} t={t} ch={<AddrF init={aM==="add"?{}:{name:aM.e.name,addr:aM.e.address}} onSave={dt=>{aM==="add"?d({t:"AA",...dt}):d({t:"UA",id:aM.e.id,...dt});setAM(null);}} t={t}/>}/>}
     {cM&&<Modal title={cM==="add"?"Nueva Categoría":"Editar Categoría"} onClose={()=>setCM(null)} t={t} ch={<CatF init={cM==="add"?{}:{name:cM.e.name,icon:cM.e.icon,color:cM.e.color}} onSave={dt=>{cM==="add"?d({t:"ATC",aid:addr.id,...dt}):d({t:"UTC",aid:addr.id,cid:cM.e.id,...dt});setCM(null);}} existing={cats.map(c=>c.name)} t={t}/>}/>}
-    {iM&&<Modal title={iM.e?"Editar Gasto Fijo":"Nuevo Gasto Fijo"} onClose={()=>setIM(null)} t={t} ch={<TmplItemF init={iM.e?{name:iM.e.name,amount:iM.e.amount,isVariable:iM.e.isVariable}:{}} onSave={dt=>{iM.e?d({t:"UTI",aid:addr.id,cid:iM.cid,iid:iM.e.id,...dt}):d({t:"ATI",aid:addr.id,cid:iM.cid,...dt});setIM(null);}} t={t}/>}/>}
+    {iM&&<Modal title={iM.e?"Editar Gasto Fijo":"Nuevo Gasto Fijo"} onClose={()=>setIM(null)} t={t} ch={<TmplItemF init={iM.e?{name:iM.e.name,amount:iM.e.amount,isVariable:iM.e.isVariable,frequency:iM.e.frequency,dueDay:iM.e.dueDay,autoDetect:iM.e.autoDetect}:{}} onSave={dt=>{iM.e?d({t:"UTI",aid:addr.id,cid:iM.cid,iid:iM.e.id,...dt}):d({t:"ATI",aid:addr.id,cid:iM.cid,...dt});setIM(null);}} t={t}/>}/>}
     {gM&&<Modal title="🗂️ Gestionar Categorías" onClose={()=>setGM(false)} t={t} w="540px" ch={<CatManagerModal addr={addr} d={d} t={t} onClose={()=>setGM(false)}/>}/>}
     {cfm&&<Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>}
   </div>;
@@ -809,6 +932,7 @@ function CatF({init,onSave,existing=[],t}){
 
 function TmplItemF({init,onSave,t}){
   const[name,setName]=useState(init.name||"");const[amount,setAmount]=useState(init.amount||0);const[isVariable,setIsVariable]=useState(init.isVariable||false);const[freq,setFreq]=useState(init.frequency||"mensual");
+  const[dueDay,setDueDay]=useState(init.dueDay||"");const[autoDetect,setAutoDetect]=useState(init.autoDetect||false);
   const mEq=Math.round((amount||0)*(MF[freq]||1));
   return <>
     <Fld label="Nombre del gasto" ch={<TI val={name} onChange={setName} ph="Arriendo, Luz, Internet, Agua, Netflix..." t={t}/>} t={t}/>
@@ -818,46 +942,75 @@ function TmplItemF({init,onSave,t}){
       <span>Equivalente mensual: <strong style={{color:t.info}}>{new Intl.NumberFormat("es-CL",{style:"currency",currency:"CLP",maximumFractionDigits:0}).format(mEq)}</strong></span>
       <span style={{marginLeft:"0.75rem"}}>· Anual: <strong style={{color:t.info}}>{new Intl.NumberFormat("es-CL",{style:"currency",currency:"CLP",maximumFractionDigits:0}).format(mEq*12)}</strong></span>
     </div>}
-    <label style={{display:"flex",alignItems:"flex-start",gap:"0.65rem",cursor:"pointer",padding:"0.65rem 0.75rem",background:t.card2,borderRadius:"0.5rem",marginBottom:"0.9rem"}}>
+    <label style={{display:"flex",alignItems:"flex-start",gap:"0.65rem",cursor:"pointer",padding:"0.65rem 0.75rem",background:t.card2,borderRadius:"0.5rem",marginBottom:"0.65rem"}}>
       <input type="checkbox" checked={isVariable} onChange={e=>setIsVariable(e.target.checked)} style={{width:"16px",height:"16px",accentColor:t.info,marginTop:"0.15rem"}}/>
       <div>
         <div style={{color:t.text,fontSize:"0.84rem",fontWeight:600}}>Monto variable</div>
         <div style={{color:t.dim,fontSize:"0.73rem"}}>Marca esto si el monto cambia cada mes (luz, agua, teléfono). El monto que pones aquí es solo una estimación que puedes ajustar cuando pagas.</div>
       </div>
     </label>
-    <Btn onClick={()=>name&&onSave({name,amount,isVariable,frequency:freq})} dis={!name} full icon={<Check size={14}/>}>{init.name?"Actualizar":"Agregar a plantilla"}</Btn>
+    <Fld label="Día del mes en que se cobra (opcional)" ch={<TI val={dueDay} onChange={setDueDay} type="number" ph="Ej: 5" t={t}/>} t={t}/>
+    {dueDay&&<label style={{display:"flex",alignItems:"flex-start",gap:"0.65rem",cursor:"pointer",padding:"0.65rem 0.75rem",background:t.pri+"10",border:`1px solid ${t.pri}30`,borderRadius:"0.5rem",marginBottom:"0.9rem"}}>
+      <input type="checkbox" checked={autoDetect} onChange={e=>setAutoDetect(e.target.checked)} style={{width:"16px",height:"16px",accentColor:t.pri,marginTop:"0.15rem"}}/>
+      <div>
+        <div style={{color:t.text,fontSize:"0.84rem",fontWeight:600}}>🔔 Avisarme automáticamente</div>
+        <div style={{color:t.dim,fontSize:"0.73rem"}}>Al abrir Inicio desde el día {dueDay} en adelante, te preguntamos si ya se pagó — confirmas con un tap.</div>
+      </div>
+    </label>}
+    <Btn onClick={()=>name&&onSave({name,amount,isVariable,frequency:freq,dueDay:dueDay?+dueDay:null,autoDetect:dueDay?autoDetect:false})} dis={!name} full icon={<Check size={14}/>}>{init.name?"Actualizar":"Agregar a plantilla"}</Btn>
   </>;
 }
 
 /* ══ HISTORIAL — CALENDARIO MENSUAL ═════════════════════ */
 function HistorialView({s,d,t}){
-  const[selDay,setSelDay]=useState(null);const[payModal,setPayModal]=useState(null);const[cfm,setCfm]=useState(null);const[editPay,setEditPay]=useState(null);
+  const[selDay,setSelDay]=useState(null);const[payModal,setPayModal]=useState(null);const[abonoModal,setAbonoModal]=useState(null);const[cfm,setCfm]=useState(null);const[editPay,setEditPay]=useState(null);const[editAbono,setEditAbono]=useState(null);
+  const[panelMode,setPanelMode]=useState("gastos");
   const addr=s.addresses.find(a=>a.id===s.selAddr);
   const pays=addr?mPays(addr,s.selYear,s.selMonth):[];
+  const abonos=addr?mAbonos(addr,s.selYear,s.selMonth):[];
   const pending=addr?pendingTmpl(addr,s.selYear,s.selMonth):[];
   const paidItems=addr?paidTmpl(addr,s.selYear,s.selMonth):[];
   const extras=addr?extraPays(addr,s.selYear,s.selMonth):[];
+  const pendingInc=addr?pendingIncomes(s.profile,addr,s.selYear,s.selMonth):[];
+  const paidInc=addr?paidIncomes(s.profile,addr,s.selYear,s.selMonth):[];
+  const extraAb=addr?extraAbonos(addr,s.selYear,s.selMonth):[];
   const catNames=[...new Set((addr?.template?.categories||[]).map(c=>c.name))];
   const budget=addr?tmplTotal(addr):0;const paid=addr?totalPaid(addr,s.selYear,s.selMonth):0;
+  const recibido=addr?totalAbonos(addr,s.selYear,s.selMonth):0;
+  const esperadoInc=sumInc(s.profile);
   const daysInMonth=new Date(s.selYear,s.selMonth+1,0).getDate();
   const offset=(new Date(s.selYear,s.selMonth,1).getDay()+6)%7;
-  const byDay={};pays.forEach(p=>{if(!p.date)return;const day=parseInt(p.date.split("-")[2]);if(!byDay[day])byDay[day]=[];byDay[day].push(p);});
-  const selDayPays=selDay?(byDay[selDay]||[]):[];
+  const byDay={};
+  pays.forEach(p=>{if(!p.date)return;const day=parseInt(p.date.split("-")[2]);if(!byDay[day])byDay[day]=[];byDay[day].push({...p,_kind:"pago"});});
+  abonos.forEach(a=>{if(!a.date)return;const day=parseInt(a.date.split("-")[2]);if(!byDay[day])byDay[day]=[];byDay[day].push({...a,_kind:"abono"});});
+  const selDayItems=selDay?(byDay[selDay]||[]):[];
   const goM=dir=>{let nm=s.selMonth+dir,ny=s.selYear;if(nm<0){nm=11;ny--;}if(nm>11){nm=0;ny++;}d({t:"YM",month:nm,year:ny});setSelDay(null);};
   const mkDate=day=>`${s.selYear}-${String(s.selMonth+1).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
 
   if(!addr)return <CCard ch={<Empty icon={<Building2 size={36}/>} title="Sin dirección" sub="Configura una dirección en Gastos Fijos para ver el historial." t={t}/>} t={t}/>;
 
   return <div>
-    <SH title="Historial de Pagos" sub={`${addr.name} · ${MESES[s.selMonth]} ${s.selYear}`} t={t}
-      action={<Btn onClick={()=>setPayModal({date:todayStr(),isExtra:true})} icon={<Zap size={14}/>} sz="sm">⚡ Pago extra</Btn>}/>
-    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:"0.75rem",marginBottom:"1rem"}}>
+    <SH title="Historial" sub={`${addr.name} · ${MESES[s.selMonth]} ${s.selYear}`} t={t}
+      action={panelMode==="gastos"?<Btn onClick={()=>setPayModal({date:todayStr(),isExtra:true})} icon={<Zap size={14}/>} sz="sm">⚡ Pago extra</Btn>:<Btn onClick={()=>setAbonoModal({date:todayStr(),isExtra:true})} v="ok" icon={<TrendingUp size={14}/>} sz="sm">💰 Abono extra</Btn>}/>
+
+    {/* Toggle Gastos / Ingresos */}
+    <div style={{display:"flex",gap:"0.4rem",marginBottom:"1rem",background:t.card2,padding:"0.3rem",borderRadius:"0.6rem",border:`1px solid ${t.border}`}}>
+      <button onClick={()=>setPanelMode("gastos")} style={{flex:1,padding:"0.45rem",background:panelMode==="gastos"?t.pri:"transparent",color:panelMode==="gastos"?"#fff":t.muted,border:"none",borderRadius:"0.45rem",cursor:"pointer",fontWeight:700,fontSize:"0.83rem"}}>💸 Gastos</button>
+      <button onClick={()=>setPanelMode("ingresos")} style={{flex:1,padding:"0.45rem",background:panelMode==="ingresos"?t.ok:"transparent",color:panelMode==="ingresos"?"#fff":t.muted,border:"none",borderRadius:"0.45rem",cursor:"pointer",fontWeight:700,fontSize:"0.83rem"}}>💰 Ingresos</button>
+    </div>
+
+    {panelMode==="gastos"?<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:"0.75rem",marginBottom:"1rem"}}>
       <StCard label="Presupuestado" val={fCLP(budget)} color={t.pri} icon={<Target size={16} color={t.pri}/>} t={t}/>
       <StCard label="Pagado" val={fCLP(paid)} color={t.ok} icon={<CheckCircle2 size={16} color={t.ok}/>} sub={`${paidItems.length+extras.length} pagos`} t={t}/>
       <StCard label="Pendiente" val={fCLP(pending.reduce((s,i)=>s+Math.max(0,i.monthlyAmt-i.accumulated),0))} color={t.err} icon={<Clock size={16} color={t.err}/>} sub={`${pending.length} ítems`} t={t}/>
-    </div>
+    </div>:<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:"0.75rem",marginBottom:"1rem"}}>
+      <StCard label="Esperado" val={fCLP(esperadoInc)} color={t.ok} icon={<Target size={16} color={t.ok}/>} t={t}/>
+      <StCard label="Recibido" val={fCLP(recibido)} color={t.ok} icon={<CheckCircle2 size={16} color={t.ok}/>} sub={`${paidInc.length+extraAb.length} abonos`} t={t}/>
+      <StCard label="Falta recibir" val={fCLP(pendingInc.reduce((s,i)=>s+Math.max(0,i.monthlyAmt-i.accumulated),0))} color={t.warn} icon={<Clock size={16} color={t.warn}/>} sub={`${pendingInc.length} ítems`} t={t}/>
+    </div>}
+
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"1rem",marginBottom:"1rem",alignItems:"start"}}>
-      {/* Calendario */}
+      {/* Calendario — muestra ambos tipos siempre, sin importar el toggle */}
       <CCard ch={<>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"0.75rem"}}>
           <button onClick={()=>goM(-1)} style={{background:"none",border:"none",cursor:"pointer",color:t.muted,padding:"0.3rem",display:"flex"}}><ChevronLeft size={17}/></button>
@@ -875,31 +1028,36 @@ function HistorialView({s,d,t}){
             const isSel=selDay===day;
             return <div key={day} onClick={()=>setSelDay(isSel?null:day)} style={{aspectRatio:"1",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",borderRadius:"0.4rem",cursor:"pointer",background:isSel?t.pri:isToday?t.pri+"28":dp.length?t.ok+"18":"none",border:isSel?`1px solid ${t.pri}`:isToday?`1px solid ${t.pri}60`:"1px solid transparent",transition:"all .15s"}}>
               <span style={{fontSize:"0.76rem",fontWeight:isToday||isSel?700:400,color:isSel?"#fff":isToday?t.pri:t.text,lineHeight:1}}>{day}</span>
-              {dp.length>0&&<div style={{display:"flex",gap:"1px",marginTop:"2px"}}>{dp.slice(0,3).map((p,pi)=><div key={pi} style={{width:"4px",height:"4px",borderRadius:"50%",background:isSel?"rgba(255,255,255,.7)":p.isExtra?t.warn:t.ok}}/>)}</div>}
+              {dp.length>0&&<div style={{display:"flex",gap:"1px",marginTop:"2px"}}>{dp.slice(0,3).map((p,pi)=><div key={pi} style={{width:"4px",height:"4px",borderRadius:"50%",background:isSel?"rgba(255,255,255,.7)":p._kind==="abono"?t.info:p.isExtra?t.warn:t.ok}}/>)}</div>}
             </div>;
           })}
         </div>
-        <div style={{display:"flex",gap:"1rem",marginTop:"0.75rem",fontSize:"0.67rem",color:t.dim,justifyContent:"center"}}>
-          <span style={{display:"flex",alignItems:"center",gap:"0.3rem"}}><div style={{width:"6px",height:"6px",borderRadius:"50%",background:t.ok}}/> Fijo pagado</span>
-          <span style={{display:"flex",alignItems:"center",gap:"0.3rem"}}><div style={{width:"6px",height:"6px",borderRadius:"50%",background:t.warn}}/> Extra</span>
+        <div style={{display:"flex",gap:"0.75rem",marginTop:"0.75rem",fontSize:"0.65rem",color:t.dim,justifyContent:"center",flexWrap:"wrap"}}>
+          <span style={{display:"flex",alignItems:"center",gap:"0.25rem"}}><div style={{width:"6px",height:"6px",borderRadius:"50%",background:t.ok}}/> Fijo pagado</span>
+          <span style={{display:"flex",alignItems:"center",gap:"0.25rem"}}><div style={{width:"6px",height:"6px",borderRadius:"50%",background:t.warn}}/> Gasto extra</span>
+          <span style={{display:"flex",alignItems:"center",gap:"0.25rem"}}><div style={{width:"6px",height:"6px",borderRadius:"50%",background:t.info}}/> Abono</span>
         </div>
         {selDay&&<div style={{marginTop:"0.75rem",borderTop:`1px solid ${t.border}`,paddingTop:"0.75rem"}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"0.5rem"}}>
             <span style={{color:t.text,fontWeight:700,fontSize:"0.85rem"}}>{selDay} de {MESES[s.selMonth]}</span>
-            <Btn onClick={()=>setPayModal({date:mkDate(selDay),isExtra:true})} v="ghost" sz="sm" icon={<Plus size={12}/>}>Agregar</Btn>
+            <div style={{display:"flex",gap:"0.3rem"}}>
+              <Btn onClick={()=>setPayModal({date:mkDate(selDay),isExtra:true})} v="ghost" sz="sm" icon={<Plus size={11}/>}>Gasto</Btn>
+              <Btn onClick={()=>setAbonoModal({date:mkDate(selDay),isExtra:true})} v="ghost" sz="sm" icon={<Plus size={11}/>}>Abono</Btn>
+            </div>
           </div>
-          {selDayPays.length===0&&<p style={{color:t.dim,fontSize:"0.79rem",margin:0}}>Sin pagos este día.</p>}
-          {selDayPays.map(p=><div key={p.id} style={{display:"flex",gap:"0.5rem",padding:"0.35rem 0.6rem",background:t.card2,borderRadius:"0.4rem",marginBottom:"0.25rem",alignItems:"center"}}>
-            <span style={{fontSize:"0.85rem"}}>{p.isExtra?"⚡":"✓"}</span>
-            <div style={{flex:1,minWidth:0}}><div style={{color:t.text,fontSize:"0.79rem",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</div>{p.method&&<div style={{color:t.dim,fontSize:"0.67rem"}}>{p.method}</div>}</div>
-            <span style={{color:p.isExtra?t.warn:t.ok,fontSize:"0.79rem",fontWeight:700,whiteSpace:"nowrap"}}>{fCLP(p.amount)}</span>
-            <button onClick={()=>setEditPay(p)} style={{background:"none",border:"none",cursor:"pointer",color:t.muted,padding:"0.15rem",display:"flex"}}><Edit2 size={11}/></button>
-            <button onClick={()=>setCfm({msg:`¿Eliminar "${p.name}"?`,ok:()=>{d({t:"DEL_PAY",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.err,padding:"0.15rem",display:"flex"}}><Trash2 size={11}/></button>
+          {selDayItems.length===0&&<p style={{color:t.dim,fontSize:"0.79rem",margin:0}}>Sin movimientos este día.</p>}
+          {selDayItems.map(p=><div key={p.id} style={{display:"flex",gap:"0.5rem",padding:"0.35rem 0.6rem",background:t.card2,borderRadius:"0.4rem",marginBottom:"0.25rem",alignItems:"center"}}>
+            <span style={{fontSize:"0.85rem"}}>{p._kind==="abono"?"💰":p.isExtra?"⚡":"✓"}</span>
+            <div style={{flex:1,minWidth:0}}><div style={{color:t.text,fontSize:"0.79rem",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</div>{(p.method||p.source)&&<div style={{color:t.dim,fontSize:"0.67rem"}}>{p.method||p.source}</div>}</div>
+            <span style={{color:p._kind==="abono"?t.info:p.isExtra?t.warn:t.ok,fontSize:"0.79rem",fontWeight:700,whiteSpace:"nowrap"}}>{p._kind==="abono"?"+":"-"}{fCLP(p.amount)}</span>
+            <button onClick={()=>p._kind==="abono"?setEditAbono(p):setEditPay(p)} style={{background:"none",border:"none",cursor:"pointer",color:t.muted,padding:"0.15rem",display:"flex"}}><Edit2 size={11}/></button>
+            <button onClick={()=>setCfm({msg:`¿Eliminar "${p.name}"?`,ok:()=>{d({t:p._kind==="abono"?"DEL_ABONO":"DEL_PAY",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.err,padding:"0.15rem",display:"flex"}}><Trash2 size={11}/></button>
           </div>)}
         </div>}
       </>} t={t}/>
-      {/* Panel ítems */}
-      <div style={{display:"flex",flexDirection:"column",gap:"0.65rem"}}>
+
+      {/* Panel — cambia según el toggle Gastos/Ingresos */}
+      {panelMode==="gastos"?<div style={{display:"flex",flexDirection:"column",gap:"0.65rem"}}>
         {pending.length>0&&<CCard ch={<>
           <h4 style={{margin:"0 0 0.65rem",color:t.text,fontSize:"0.88rem",fontWeight:700}}>⏳ Pendiente ({pending.length})</h4>
           <div style={{maxHeight:"200px",overflowY:"auto",display:"flex",flexDirection:"column",gap:"0.35rem"}}>
@@ -945,10 +1103,58 @@ function HistorialView({s,d,t}){
           </div>
         </>} t={t}/>}
         {pending.length===0&&paidItems.length===0&&extras.length===0&&<CCard ch={<Empty icon={<Calendar size={30}/>} title="Sin actividad este mes" sub='Marca gastos como pagados o agrega un pago extra.' t={t}/>} t={t}/>}
-      </div>
+      </div>:<div style={{display:"flex",flexDirection:"column",gap:"0.65rem"}}>
+        {pendingInc.length>0&&<CCard ch={<>
+          <h4 style={{margin:"0 0 0.65rem",color:t.text,fontSize:"0.88rem",fontWeight:700}}>⏳ Por recibir ({pendingInc.length})</h4>
+          <div style={{maxHeight:"200px",overflowY:"auto",display:"flex",flexDirection:"column",gap:"0.35rem"}}>
+            {pendingInc.map(inc=><div key={inc.id} style={{display:"flex",alignItems:"center",gap:"0.45rem",padding:"0.45rem 0.6rem",background:t.card2,borderRadius:"0.45rem",border:`1px solid ${t.border}`}}>
+              <DollarSign size={14} color={t.ok}/>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{color:t.text,fontSize:"0.81rem",fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{inc.name}</div>
+                <div style={{color:t.dim,fontSize:"0.68rem"}}>{inc.type}{inc.accumulated>0?` · recibido ${fCLP(inc.accumulated)}`:""}</div>
+              </div>
+              <span style={{color:t.dim,fontSize:"0.78rem",whiteSpace:"nowrap"}}>{fCLP(inc.monthlyAmt)}</span>
+              <Btn onClick={()=>setAbonoModal({date:todayStr(),isExtra:false,itemId:inc.id,itemName:inc.name,estimated:inc.monthlyAmt,remaining:inc.monthlyAmt-inc.accumulated,accumulated:inc.accumulated})} v={inc.accumulated>0?"out":"ok"} sz="sm">{inc.accumulated>0?"+ Abonar":"Confirmar"}</Btn>
+            </div>)}
+          </div>
+        </>} t={t}/>}
+        {(paidInc.length>0||extraAb.length>0)&&<CCard ch={<>
+          <h4 style={{margin:"0 0 0.65rem",color:t.text,fontSize:"0.88rem",fontWeight:700}}>✅ Recibido</h4>
+          <div style={{maxHeight:"200px",overflowY:"auto",display:"flex",flexDirection:"column",gap:"0.3rem"}}>
+            {paidInc.map(inc=><div key={inc.id} style={{padding:"0.4rem 0.6rem",background:t.ok+"10",borderRadius:"0.45rem",border:`1px solid ${t.ok}30`}}>
+              <div style={{display:"flex",alignItems:"center",gap:"0.45rem"}}>
+                {inc.isPaid?<CheckCircle2 size={13} color={t.ok}/>:<Clock size={13} color={t.warn}/>}
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{color:t.text,fontSize:"0.8rem",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{inc.name}{inc.pays.length>1?` (${inc.pays.length})`:""}</div>
+                  <div style={{color:t.dim,fontSize:"0.67rem"}}>{fmtDate(inc.pays[inc.pays.length-1]?.date)}</div>
+                </div>
+                <span style={{color:inc.isPaid?t.ok:t.warn,fontSize:"0.79rem",fontWeight:700,whiteSpace:"nowrap"}}>{fCLP(inc.accumulated)}{!inc.isPaid?`/${fCLP(inc.monthlyAmt)}`:""}</span>
+                {inc.pays.length===1&&<><button onClick={()=>setEditAbono(inc.pays[0])} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.15rem",display:"flex"}}><Edit2 size={11}/></button><button onClick={()=>setCfm({msg:`¿Desmarcar "${inc.name}"?`,ok:()=>{d({t:"DEL_ABONO",aid:addr.id,pid:inc.pays[0].id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.15rem",display:"flex"}}><RotateCcw size={11}/></button></>}
+              </div>
+              {inc.pays.length>1&&<div style={{marginLeft:"1.6rem",marginTop:"0.25rem",display:"flex",flexDirection:"column",gap:"0.15rem"}}>
+                {inc.pays.map(p=><div key={p.id} style={{display:"flex",gap:"0.35rem",fontSize:"0.68rem",color:t.dim,alignItems:"center"}}>
+                  <span style={{flex:1}}>{fmtDate(p.date)}</span><span>{fCLP(p.amount)}</span>
+                  <button onClick={()=>setEditAbono(p)} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.1rem",display:"flex"}}><Edit2 size={9}/></button>
+                  <button onClick={()=>setCfm({msg:`¿Eliminar este abono?`,ok:()=>{d({t:"DEL_ABONO",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.dim,padding:"0.1rem",display:"flex"}}><Trash2 size={9}/></button>
+                </div>)}
+              </div>}
+            </div>)}
+            {extraAb.map(p=><div key={p.id} style={{display:"flex",alignItems:"center",gap:"0.45rem",padding:"0.4rem 0.6rem",background:t.info+"10",borderRadius:"0.45rem",border:`1px solid ${t.info}30`}}>
+              <TrendingUp size={12} color={t.info}/>
+              <div style={{flex:1,minWidth:0}}><div style={{color:t.text,fontSize:"0.8rem",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</div><div style={{color:t.dim,fontSize:"0.67rem"}}>{fmtDate(p.date)}</div></div>
+              <span style={{color:t.info,fontSize:"0.79rem",fontWeight:700,whiteSpace:"nowrap"}}>{fCLP(p.amount)}</span>
+              <button onClick={()=>setEditAbono(p)} style={{background:"none",border:"none",cursor:"pointer",color:t.muted,padding:"0.15rem",display:"flex"}}><Edit2 size={11}/></button>
+              <button onClick={()=>setCfm({msg:`¿Eliminar "${p.name}"?`,ok:()=>{d({t:"DEL_ABONO",aid:addr.id,pid:p.id});setCfm(null);}})} style={{background:"none",border:"none",cursor:"pointer",color:t.err,padding:"0.15rem",display:"flex"}}><Trash2 size={11}/></button>
+            </div>)}
+          </div>
+        </>} t={t}/>}
+        {pendingInc.length===0&&paidInc.length===0&&extraAb.length===0&&<CCard ch={<Empty icon={<TrendingUp size={30}/>} title="Sin ingresos este mes" sub='Registra un abono o define ingresos recurrentes en tu Perfil.' t={t}/>} t={t}/>}
+      </div>}
     </div>
     {payModal&&<PayModal state={payModal} t={t} addr={addr} d={d} profile={s.profile} onClose={()=>setPayModal(null)} onSave={dt=>{d({t:"ADD_PAY",aid:addr.id,d:dt});setPayModal(null);}}/>}
+    {abonoModal&&<AbonoModal state={abonoModal} t={t} onClose={()=>setAbonoModal(null)} onSave={dt=>{d({t:"ADD_ABONO",aid:addr.id,d:dt});setAbonoModal(null);}}/>}
     {editPay&&<EditPayModal pay={editPay} t={t} profile={s.profile} onClose={()=>setEditPay(null)} onSave={dt=>{d({t:"UPD_PAY",aid:addr.id,pid:editPay.id,d:dt});setEditPay(null);}}/>}
+    {editAbono&&<EditPayModal pay={editAbono} t={t} isAbono onClose={()=>setEditAbono(null)} onSave={dt=>{d({t:"UPD_ABONO",aid:addr.id,pid:editAbono.id,d:dt});setEditAbono(null);}}/>}
     {cfm&&<Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>}
   </div>;
 }
@@ -971,6 +1177,7 @@ function AnalisisView({s,d,t}){
   const catAgg={};selM.forEach(m=>(addr?mPays(addr,m.year,m.month):[]).forEach(p=>{if(p.catName)catAgg[p.catName]=(catAgg[p.catName]||0)+(p.amount||0);}));
   const pieData=Object.entries(catAgg).map(([name,value])=>({name,value})).sort((a,b)=>b.value-a.value);
   const totalPaidAll=selM.reduce((s,m)=>s+(addr?totalPaid(addr,m.year,m.month):0),0);
+  const totalAbonosAll=selM.reduce((s,m)=>s+(addr?totalAbonos(addr,m.year,m.month):0),0);
 
   const exportExcel=()=>{
     if(!addr||!selM.length)return;
@@ -1040,6 +1247,11 @@ function AnalisisView({s,d,t}){
         <StCard label="Diferencia" val={fCLP(Math.abs(totalPaidAll-budget*selM.length))} color={totalPaidAll>budget*selM.length?t.err:t.ok} sub={totalPaidAll>budget*selM.length?"sobre presupuesto":"bajo presupuesto"} t={t}/>
         <StCard label="Promedio mensual" val={fCLP(Math.round(totalPaidAll/selM.length))} color={t.warn} t={t}/>
       </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(145px,1fr))",gap:"0.75rem",marginBottom:"1rem"}}>
+        <StCard label="Total ingresos (abonos)" val={fCLP(totalAbonosAll)} color={t.info} icon={<TrendingUp size={16} color={t.info}/>} t={t}/>
+        <StCard label="Flujo neto del período" val={fCLP(totalAbonosAll-totalPaidAll)} color={totalAbonosAll-totalPaidAll>=0?t.ok:t.err} sub={totalAbonosAll-totalPaidAll>=0?"a favor":"en contra"} t={t}/>
+        {addr?.startingBalanceDate&&<StCard label="Saldo estimado hoy" val={fCLP(balanceAsOf(addr))} color={balanceAsOf(addr)>=0?t.ok:t.err} icon={<DollarSign size={16} color={balanceAsOf(addr)>=0?t.ok:t.err}/>} t={t}/>}
+      </div>
       <CCard ch={<><h4 style={{margin:"0 0 0.85rem",color:t.text,fontSize:"0.9rem",fontWeight:700}}>Presupuesto vs Pagado por mes</h4>
         <ResponsiveContainer width="100%" height={210}><BarChart data={barData} margin={{top:5,right:5,left:0,bottom:5}}><CartesianGrid strokeDasharray="3 3" stroke={t.border}/><XAxis dataKey="name" stroke={t.muted} tick={{fontSize:10,fill:t.muted}}/><YAxis stroke={t.muted} tick={{fontSize:10,fill:t.muted}} tickFormatter={v=>v>=1e6?`${(v/1e6).toFixed(1)}M`:v>=1e3?`${(v/1e3).toFixed(0)}K`:v}/><Tooltip cursor={{fill:t.pri,fillOpacity:0.08}} formatter={v=>fCLP(v)} contentStyle={{background:t.card,border:`1px solid ${t.border}`,borderRadius:"0.5rem",color:t.text,fontSize:"0.79rem"}}/><Legend wrapperStyle={{fontSize:"0.75rem"}}/><Bar dataKey="Presupuesto" fill={t.pri+"66"} radius={[3,3,0,0]}/><Bar dataKey="Pagado" fill={t.ok} radius={[3,3,0,0]}/></BarChart></ResponsiveContainer>
       </>} t={t} sx={{marginBottom:"1rem"}}/>
@@ -1065,6 +1277,9 @@ function AnalisisView({s,d,t}){
 function PerfilView({s,d,t}){
   const[iM,setIM]=useState(null);const[gM,setGM]=useState(false);const[cfm,setCfm]=useState(null);const[pmM,setPmM]=useState(false);
   const[apiKey,setApiKey]=useState(getAK);const[showAK,setShowAK]=useState(false);
+  const addr=s.addresses.find(a=>a.id===s.selAddr);
+  const[balAmt,setBalAmt]=useState(addr?.startingBalance||0);
+  const[balDate,setBalDate]=useState(addr?.startingBalanceDate||todayStr());
   const mInc=sumInc(s.profile);
 
   const exportData=()=>{try{const blob=new Blob([JSON.stringify(s,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`gestor-gastos-backup-${new Date().toISOString().split("T")[0]}.json`;a.click();URL.revokeObjectURL(url);}catch(e){alert("Error al exportar: "+e.message);}};
@@ -1080,7 +1295,22 @@ function PerfilView({s,d,t}){
         <label style={{cursor:"pointer",flex:1}}>Mostrar alerta cuando los gastos superan mis ingresos</label>
       </div>
     </>} t={t} sx={{marginBottom:"1rem"}}/>
-    {/* API Key */}
+    {/* Saldo de cuenta — base para el flujo de dinero */}
+    <CCard ch={<>
+      <h4 style={{margin:"0 0 0.5rem",color:t.text,fontSize:"0.9rem",fontWeight:700}}>💳 Saldo de tu cuenta</h4>
+      {!addr?<p style={{color:t.muted,fontSize:"0.83rem",margin:0}}>Crea una dirección en Gastos Fijos primero — ahí es donde se registra tu flujo de dinero.</p>:<>
+        <p style={{color:t.muted,fontSize:"0.82rem",margin:"0 0 0.75rem",lineHeight:1.5}}>Ingresa cuánta plata tienes hoy en <strong style={{color:t.text}}>{addr.name}</strong>. Desde ahí, cada pago y abono que registres ajusta tu saldo automáticamente — como un historial de flujo de dinero.</p>
+        <div style={{display:"flex",gap:"0.5rem",flexWrap:"wrap",alignItems:"flex-end"}}>
+          <div style={{flex:1,minWidth:"140px"}}><Fld label="Monto actual" ch={<MoneyInput val={balAmt} onChange={setBalAmt} t={t}/>} t={t}/></div>
+          <div style={{flex:1,minWidth:"140px"}}><Fld label="¿A qué fecha?" ch={<TI val={balDate} onChange={setBalDate} type="date" t={t}/>} t={t}/></div>
+          <Btn onClick={()=>d({t:"SET_BALANCE",aid:addr.id,amount:balAmt,date:balDate})} icon={<Check size={14}/>} sx={{marginBottom:"0.85rem"}}>Guardar</Btn>
+        </div>
+        {addr.startingBalanceDate&&<div style={{padding:"0.55rem 0.75rem",background:t.ok+"12",borderRadius:"0.5rem",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span style={{color:t.muted,fontSize:"0.8rem"}}>Saldo estimado ahora</span>
+          <span style={{color:balanceAsOf(addr)>=0?t.ok:t.err,fontWeight:800,fontSize:"0.95rem"}}>{fCLP(balanceAsOf(addr))}</span>
+        </div>}
+      </>}
+    </>} t={t} sx={{marginBottom:"1rem"}}/>
     <CCard ch={<>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:(!apiKey||showAK)?"0.65rem":"0"}}>
         <div style={{display:"flex",alignItems:"center",gap:"0.5rem"}}>
@@ -1185,7 +1415,18 @@ function PerfilView({s,d,t}){
         <Btn onClick={()=>setCfm({msg:"¿Eliminar TODOS tus datos? Esta acción no se puede deshacer.",ok:()=>{d({t:"LOAD",d:INIT});setCfm(null);}})} v="ghost" sx={{color:t.err}}>🗑️ Borrar todo</Btn>
       </div>
     </>} t={t}/>
-    {iM&&<Modal title={iM==="add"?"Nuevo Ingreso":"Editar Ingreso"} onClose={()=>setIM(null)} t={t} ch={<IncF init={iM==="add"?{}:{type:iM.e.type,name:iM.e.name,amount:iM.e.amount,frequency:iM.e.frequency}} onSave={dt=>{iM==="add"?d({t:"AINC",d:dt}):d({t:"UINC",id:iM.e.id,d:dt});setIM(null);}} t={t}/>}/>}
+    {/* Reiniciar cuenta — zona de peligro */}
+    {addr&&<CCard ch={<>
+      <h4 style={{margin:"0 0 0.65rem",color:t.err,fontSize:"0.9rem",fontWeight:700}}>☢️ Reiniciar cuenta</h4>
+      <p style={{color:t.muted,fontSize:"0.82rem",margin:"0 0 0.75rem",lineHeight:1.6}}>
+        Borra los <strong style={{color:t.text}}>gastos fijos, historial de pagos y abonos, y saldo</strong> de <strong style={{color:t.text}}>{addr.name}</strong>, como si empezaras de cero. Tu nombre, dirección, ingresos y objetivos del Perfil <strong style={{color:t.text}}>no se tocan</strong>.
+      </p>
+      <div style={{padding:"0.6rem 0.75rem",background:t.err+"12",border:`1px solid ${t.err}40`,borderRadius:"0.5rem",marginBottom:"0.85rem",fontSize:"0.79rem",color:t.muted}}>
+        ⚠️ Esta acción no se puede deshacer. Te recomendamos exportar un respaldo (arriba ☝️) antes de continuar.
+      </div>
+      <Btn onClick={()=>setCfm({msg:`¿Reiniciar "${addr.name}" por completo? Se borrarán todos sus gastos fijos, pagos y abonos. Esta acción NO se puede deshacer.`,ok:()=>{d({t:"RESET_ADDR",aid:addr.id});setCfm(null);}})} v="err" icon={<RefreshCw size={14}/>}>Reiniciar {addr.name} desde cero</Btn>
+    </>} t={t} sx={{marginBottom:"1rem",border:`1px solid ${t.err}30`}}/>}
+    {iM&&<Modal title={iM==="add"?"Nuevo Ingreso":"Editar Ingreso"} onClose={()=>setIM(null)} t={t} ch={<IncF init={iM==="add"?{}:{type:iM.e.type,name:iM.e.name,amount:iM.e.amount,frequency:iM.e.frequency,dueDay:iM.e.dueDay,autoDetect:iM.e.autoDetect}} onSave={dt=>{iM==="add"?d({t:"AINC",d:dt}):d({t:"UINC",id:iM.e.id,d:dt});setIM(null);}} t={t}/>}/>}
     {gM&&<Modal title="Nuevo Objetivo" onClose={()=>setGM(false)} t={t} ch={<GoalF onSave={dt=>{d({t:"AG",d:dt});setGM(false);}} t={t}/>}/>}
     {pmM&&<Modal title="Nueva Forma de Pago" onClose={()=>setPmM(false)} t={t} ch={<PayMethodF onSave={name=>{d({t:"APM",name});setPmM(false);}} t={t}/>}/>}
     {cfm&&<Cfm msg={cfm.msg} onOk={cfm.ok} onCancel={()=>setCfm(null)} t={t}/>}
@@ -1193,6 +1434,7 @@ function PerfilView({s,d,t}){
 }
 function IncF({init,onSave,t}){
   const[type,setType]=useState(init.type||INC_TYPES[0]);const[name,setName]=useState(init.name||"");const[amount,setAmount]=useState(init.amount||0);const[freq,setFreq]=useState(init.frequency||"mensual");
+  const[dueDay,setDueDay]=useState(init.dueDay||"");const[autoDetect,setAutoDetect]=useState(init.autoDetect||false);
   const eq=Math.round(amount*(MF[freq]||1));
   return <>
     <Fld label="Tipo" ch={<Sel val={type} onChange={setType} opts={INC_TYPES} t={t}/>} t={t}/>
@@ -1200,7 +1442,15 @@ function IncF({init,onSave,t}){
     <Fld label="Monto" ch={<MoneyInput val={amount} onChange={setAmount} t={t}/>} t={t}/>
     <Fld label="Frecuencia" ch={<Sel val={freq} onChange={setFreq} opts={FREQS.map(f=>({v:f.v,l:f.l}))} t={t}/>} t={t}/>
     {amount>0&&freq!=="mensual"&&<div style={{padding:"0.55rem 0.75rem",background:t.ok+"12",borderRadius:"0.5rem",marginBottom:"0.85rem",color:t.muted,fontSize:"0.8rem"}}>Equivalente mensual: <strong style={{color:t.ok}}>{fCLP(eq)}</strong></div>}
-    <Btn onClick={()=>name&&amount&&onSave({type,name,amount,frequency:freq})} dis={!name||!amount} full icon={<Check size={14}/>}>{init.name?"Actualizar":"Agregar"}</Btn>
+    <Fld label="Día del mes en que suele llegar (opcional)" ch={<TI val={dueDay} onChange={setDueDay} type="number" ph="Ej: 30" t={t}/>} t={t}/>
+    {dueDay&&<label style={{display:"flex",alignItems:"flex-start",gap:"0.65rem",cursor:"pointer",padding:"0.65rem 0.75rem",background:t.ok+"10",border:`1px solid ${t.ok}30`,borderRadius:"0.5rem",marginBottom:"0.9rem"}}>
+      <input type="checkbox" checked={autoDetect} onChange={e=>setAutoDetect(e.target.checked)} style={{width:"16px",height:"16px",accentColor:t.ok,marginTop:"0.15rem"}}/>
+      <div>
+        <div style={{color:t.text,fontSize:"0.84rem",fontWeight:600}}>🔔 Avisarme automáticamente</div>
+        <div style={{color:t.dim,fontSize:"0.73rem"}}>Al abrir Inicio desde el día {dueDay} en adelante, te preguntamos si ya llegó — confirmas con un tap.</div>
+      </div>
+    </label>}
+    <Btn onClick={()=>name&&amount&&onSave({type,name,amount,frequency:freq,dueDay:dueDay?+dueDay:null,autoDetect:dueDay?autoDetect:false})} dis={!name||!amount} full icon={<Check size={14}/>}>{init.name?"Actualizar":"Agregar"}</Btn>
   </>;
 }
 function GoalF({onSave,t}){
@@ -1418,11 +1668,14 @@ function IAView({s,d,t}){
         c+="\n### GASTOS RECURRENTES NO PLANIFICADOS AGRUPADOS (posible gasto hormiga — analiza si conviene comprar todo junto en vez de de a poco):\n";
         hormiga.forEach(e=>c+=`- ${e.name}: ${e.count} pagos, total ${fCLP(e.total)} · detalle: ${e.dates.join(", ")}\n`);
       }
+      if(addr.startingBalanceDate) c+=`\n### SALDO DE CUENTA:\nSaldo estimado hoy: ${fCLP(balanceAsOf(addr))} (declarado ${fCLP(addr.startingBalance)} el ${fmtDate(addr.startingBalanceDate)}, ajustado con pagos y abonos desde entonces)\n`;
+      c+="\n### ABONOS (ingresos reales) RECIENTES:\n";
+      recMonths.forEach(m=>{const abs=mAbonos(addr,m.year,m.month);if(abs.length){c+=`\n${MESES[m.month]} ${m.year} (Total recibido: ${fCLP(totalAbonos(addr,m.year,m.month))}):\n`;abs.forEach(a=>c+=`- ${fmtDate(a.date)}: ${a.name} — ${fCLP(a.amount)}\n`);}});
     }
     if(useProf&&s.profile){
       const p=s.profile;c+="\n### PERFIL:\n";
       if(p.name)c+=`Nombre: ${p.name}\n`;
-      if(p.incomes?.length){c+=`Ingresos mensuales: ${fCLP(sumInc(p))}\n`;p.incomes.forEach(i=>c+=`- ${i.type} "${i.name}": ${fCLP(i.amount)} ${i.frequency}\n`);}
+      if(p.incomes?.length){c+=`Ingresos mensuales: ${fCLP(sumInc(p))}\n`;p.incomes.forEach(i=>c+=`- ${i.type} "${i.name}": ${fCLP(i.amount)} ${i.frequency}${i.dueDay?` (llega ~día ${i.dueDay})`:""}\n`);}
       const av=p.availability;
       c+=`Horas libres/semana: ${av.hoursPerWeek}\n`;
       if(av.canWork)c+="- Disponible para trabajar\n";if(av.studying)c+="- Estudiando\n";if(av.entrepreneur)c+="- Quiere emprender\n";
